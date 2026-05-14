@@ -1,7 +1,7 @@
-# Follow-up on {{repo.full_name}}#{{issue.number}}
+# Follow-up on {{repo.full_name}}#{{inbound.number}} ({{inbound.kind}})
 
-A new comment arrived on the issue. Current PR state:
-`{{state.pr_status}}`.
+A new comment arrived on this {{inbound.kind}} thread (originating issue
+#{{issue.number}}). Current PR state: `{{state.pr_status}}`.
 
 ## New comment by @{{comment.author}} ({{comment.created_at}})
 

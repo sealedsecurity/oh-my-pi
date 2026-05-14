@@ -32,7 +32,7 @@ def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, str]:
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     monkeypatch.delenv("ROBOMP_PROVIDER", raising=False)
-    monkeypatch.delenv("ROBOMP_REPLAY_TOKEN", raising=False)
+    monkeypatch.setenv("ROBOMP_REPLAY_TOKEN", "")
     reset_settings_cache()
     yield env
     reset_settings_cache()

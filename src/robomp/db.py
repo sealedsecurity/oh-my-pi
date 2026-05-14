@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS events (
   attempts      INTEGER NOT NULL DEFAULT 0,
   last_error    TEXT,
   started_at    TEXT,
-  finished_at   TEXT
+  finished_at   TEXT,
+  model         TEXT
 );
 
 CREATE INDEX IF NOT EXISTS events_state_received
@@ -142,9 +143,12 @@ class Database:
 
     def _migrate(self) -> None:
         # SQLite-friendly forward migrations. Each is idempotent.
-        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(issues)").fetchall()}
-        if "classification" not in cols:
+        issue_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(issues)").fetchall()}
+        if "classification" not in issue_cols:
             self._conn.execute("ALTER TABLE issues ADD COLUMN classification TEXT")
+        event_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(events)").fetchall()}
+        if "model" not in event_cols:
+            self._conn.execute("ALTER TABLE events ADD COLUMN model TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -236,6 +240,18 @@ class Database:
             self._conn.execute(
                 "UPDATE events SET state=?, last_error=?, finished_at=? WHERE delivery_id=?",
                 (state, error, _utcnow(), delivery_id),
+            )
+
+    def set_event_model(self, delivery_id: str, model: str) -> None:
+        """Persist the model the worker actually picked for this event.
+
+        Called once per run, right after `pick_model()`, so the dashboard and
+        post-mortems can attribute behavior to the exact model used.
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE events SET model=? WHERE delivery_id=?",
+                (model, delivery_id),
             )
 
     def reset_stuck_running(self) -> int:
@@ -356,15 +372,30 @@ class Database:
         return counts
 
     def list_running_events(self) -> list[dict[str, Any]]:
-        """Snapshot of currently-running events. Includes started_at for elapsed-time UI."""
+        """Snapshot of currently-running events.
+
+        Returns elapsed-time inputs (`started_at`) plus per-run telemetry:
+        - `model`: the omp model the worker picked for this run, set after
+          `pick_model()` so it reflects the actual pool selection.
+        - `last_tool` / `last_tool_ts`: the most recent host-tool call audited
+          on the same `issue_key` since `started_at`. Scoping by start time
+          prevents stale entries from a prior run on the same issue leaking
+          into the dashboard before this run has emitted any tool calls.
+        """
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT delivery_id, event_type, repo, issue_key, received_at,
-                       started_at, attempts
-                FROM events
-                WHERE state = 'running'
-                ORDER BY COALESCE(started_at, received_at)
+                SELECT e.delivery_id, e.event_type, e.repo, e.issue_key, e.received_at,
+                       e.started_at, e.attempts, e.model,
+                       (SELECT tool FROM tool_calls
+                          WHERE issue_key = e.issue_key AND ts >= e.started_at
+                          ORDER BY ts DESC LIMIT 1) AS last_tool,
+                       (SELECT ts FROM tool_calls
+                          WHERE issue_key = e.issue_key AND ts >= e.started_at
+                          ORDER BY ts DESC LIMIT 1) AS last_tool_ts
+                FROM events e
+                WHERE e.state = 'running'
+                ORDER BY COALESCE(e.started_at, e.received_at)
                 """
             ).fetchall()
         return [
@@ -376,6 +407,9 @@ class Database:
                 "received_at": r["received_at"],
                 "started_at": r["started_at"],
                 "attempts": int(r["attempts"]),
+                "model": r["model"],
+                "last_tool": r["last_tool"],
+                "last_tool_ts": r["last_tool_ts"],
             }
             for r in rows
         ]

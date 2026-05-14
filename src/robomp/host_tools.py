@@ -44,10 +44,21 @@ class ToolBindings:
     loop: asyncio.AbstractEventLoop
     author_name: str
     author_email: str
+    # Number of the GitHub thread the inbound webhook arrived on. For an
+    # issue comment this is the issue; for a PR conversation or review
+    # comment it's the PR. `gh_post_comment` defaults its target here so
+    # the agent's reply lands on the thread the human is actually reading.
+    # `None` for tasks with no inbound thread (e.g. initial triage), in
+    # which case the originating issue is used.
+    inbound_thread_number: int | None = None
 
     @property
     def issue_key(self) -> str:
         return issue_key(self.issue.repo, self.issue.number)
+
+    @property
+    def default_comment_number(self) -> int:
+        return self.inbound_thread_number if self.inbound_thread_number is not None else self.issue.number
 
 
 def _run_coro(loop: asyncio.AbstractEventLoop, coro: Any) -> Any:
@@ -250,7 +261,7 @@ def _build_post_comment(bindings: ToolBindings) -> HostTool[Any, Any]:
         body = args.get("body")
         if not isinstance(body, str) or not body.strip():
             _raise_command("gh_post_comment requires a non-empty 'body'.")
-        target_number = bindings.issue.number
+        target_number = bindings.default_comment_number
         if isinstance(args.get("number"), int):
             target_number = int(args["number"])
         try:

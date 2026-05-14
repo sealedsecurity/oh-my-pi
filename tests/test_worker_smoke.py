@@ -173,6 +173,7 @@ def test_triage_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
             github=github,
             sandbox=sandbox,
             payload=payload,
+            delivery_id="smoke-test",
         )
         row = db.get_issue("octo/widget#1")
         assert row is not None, "issue row missing"

@@ -1159,7 +1159,7 @@ def test_webhook_directive_on_unknown_issue_is_queued_with_metadata(env) -> None
     assert row is not None
     assert row.state == "queued"
     directive = row.payload.get("_robomp_directive")
-    assert directive == {"body": "please refactor X", "author": "can1357"}
+    assert directive == {"body": "please refactor X", "author": "can1357", "pragmas": []}
 
 
 def test_webhook_maintainer_bypasses_rate_limit(
@@ -1302,6 +1302,7 @@ async def test_handle_comment_directive_bootstraps_untriaged_issue(
         github=GitHubClient("t"),
         sandbox=sandbox,
         payload=payload,
+        delivery_id="test-delivery-1",
     )
     assert len(stub_run_task) == 1
     call = stub_run_task[0]
@@ -1370,6 +1371,7 @@ async def test_handle_comment_directive_reopens_finalized_issue(
         github=GitHubClient("t"),
         sandbox=sandbox,
         payload=payload,
+        delivery_id="test-delivery-2",
     )
     assert len(stub_run_task) == 1
     call = stub_run_task[0]
@@ -1442,6 +1444,7 @@ async def test_handle_comment_finalized_without_directive_still_replies(
         github=GitHubClient("t"),
         sandbox=sandbox,
         payload=payload,
+        delivery_id="test-delivery-3",
     )
     assert stub_run_task == [], "must not invoke run_task on plain finalized comment"
     assert post_comment_calls, "should post the finalized-issue reply"
@@ -1518,6 +1521,7 @@ async def test_directive_handler_attaches_thread_from_github(
         github=GitHubClient("t"),
         sandbox=sandbox,
         payload=payload,
+        delivery_id="test-delivery-4",
     )
 
     assert len(stub_run_task) == 1

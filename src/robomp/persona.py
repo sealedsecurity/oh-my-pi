@@ -196,6 +196,19 @@ def kickoff_directive(
     )
 
 
+def _inbound_scope(issue: IssueInfo, pr_number: int | None) -> dict[str, Any]:
+    """Describe the thread the inbound webhook arrived on.
+
+    For PR conversations and review comments `pr_number` is the PR; for
+    regular issue comments it's None and we fall back to the issue. The
+    `kind` field lets prompts say "PR" or "issue" without branching in the
+    template engine.
+    """
+    if pr_number is not None and pr_number != issue.number:
+        return {"kind": "PR", "number": pr_number}
+    return {"kind": "issue", "number": issue.number}
+
+
 def followup_comment(
     *,
     repo: RepoInfo,
@@ -203,6 +216,7 @@ def followup_comment(
     comment: CommentInfo,
     workspace: Workspace,
     pr_status: str,
+    pr_number: int | None = None,
 ) -> str:
     return render(
         _load("followup_comment.md"),
@@ -212,6 +226,7 @@ def followup_comment(
             "workspace": workspace,
             "comment": comment,
             "state": {"pr_status": pr_status},
+            "inbound": _inbound_scope(issue, pr_number),
         },
     )
 
@@ -224,6 +239,7 @@ def directive(
     workspace: Workspace,
     directive: Any,
     pr_status: str,
+    pr_number: int | None = None,
 ) -> str:
     """Follow-up flavor for a comment that is a maintainer directive."""
     return render(
@@ -236,6 +252,7 @@ def directive(
             "directive": {"body": directive.body, "author": directive.author},
             "thread": _render_thread(getattr(directive, "thread", ()) or ()),
             "state": {"pr_status": pr_status},
+            "inbound": _inbound_scope(issue, pr_number),
         },
     )
 

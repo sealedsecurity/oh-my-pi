@@ -312,11 +312,19 @@ function renderWorking(running, inflight) {
     const started = e.started_at || e.received_at;
     const elapsed = started ? fmtDuration((Date.now() - Date.parse(started)) / 1000) : "—";
     const [repo, number] = (e.issue_key || "").split("#");
+    const model = e.model
+      ? `<code title="${esc(e.model)}">${esc(e.model)}</code>`
+      : '<span class="muted">—</span>';
+    const lastTool = e.last_tool
+      ? `<code>${esc(e.last_tool)}</code> <span class="muted">${esc(fmtAge(e.last_tool_ts))}</span>`
+      : '<span class="muted">—</span>';
     return `<tr>
       <td>${number ? issueLink(repo, number) : `<code>${esc(e.delivery_id.slice(0, 8))}</code>`}</td>
       <td>${esc(e.event_type)}</td>
       <td><span class="pill running">running</span></td>
       <td>${elapsed}</td>
+      <td>${model}</td>
+      <td>${lastTool}</td>
       <td class="muted">attempt ${e.attempts}</td>
       <td>${CONFIG.replayEnabled
         ? `<button class="small" data-cancel="${esc(e.delivery_id)}">cancel</button>`
@@ -332,12 +340,14 @@ function renderWorking(running, inflight) {
       <td class="muted">—</td>
       <td><span class="pill running">inflight</span></td>
       <td>—</td>
+      <td class="muted">—</td>
+      <td class="muted">—</td>
       <td class="muted">held by pool</td>
       <td><span class="muted">—</span></td>
     </tr>`);
   }
   $("working").innerHTML =
-    `<table><thead><tr><th>issue</th><th>event</th><th>state</th><th>elapsed</th><th></th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
+    `<table><thead><tr><th>issue</th><th>event</th><th>state</th><th>elapsed</th><th>model</th><th>last action</th><th></th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
 }
 
 function renderIssues(issues) {

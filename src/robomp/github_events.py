@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from robomp.db import issue_key
+from robomp.pragmas import parse_pragmas
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ class RouteDecision:
     directive: bool = False
     directive_body: str | None = None
     directive_author: str | None = None
+    directive_pragmas: tuple[tuple[str, str], ...] = ()
 
     @property
     def should_queue(self) -> bool:
@@ -175,13 +177,25 @@ def route(
         if rb_login is not None:
             # Reviewer bots like chatgpt-codex-connector speak authoritatively
             # already — no `@bot` mention required; pass the full body through.
-            return {"directive": True, "directive_body": body, "directive_author": rb_login}
+            cleaned, pragmas = parse_pragmas(body)
+            return {
+                "directive": True,
+                "directive_body": cleaned,
+                "directive_author": rb_login,
+                "directive_pragmas": pragmas,
+            }
         if not is_maintainer(login, assoc, maintainers=maintainers):
             return {}
         stripped = extract_mention(body, bot_login)
         if stripped is None:
             return {}
-        return {"directive": True, "directive_body": stripped, "directive_author": login}
+        cleaned, pragmas = parse_pragmas(stripped)
+        return {
+            "directive": True,
+            "directive_body": cleaned,
+            "directive_author": login,
+            "directive_pragmas": pragmas,
+        }
 
     if event_type == "issues":
         issue = payload.get("issue") or {}

@@ -119,6 +119,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             payload["_robomp_directive"] = {
                 "body": decision.directive_body,
                 "author": decision.directive_author,
+                "pragmas": [list(item) for item in decision.directive_pragmas],
             }
 
         if not decision.should_queue:

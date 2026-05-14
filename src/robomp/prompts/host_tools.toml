@@ -1,9 +1,9 @@
 [gh_post_comment]
-description = "Post a comment on the originating issue or PR thread."
+description = "Post a comment on the GitHub thread. Defaults to whichever thread the inbound webhook arrived on (the PR for PR conversations and reviews; the issue otherwise). Pass `number` only when you need to post somewhere else."
 
 [gh_post_comment.parameters]
 body = "Markdown body of the comment."
-number = "Optional issue/PR number. Defaults to the originating issue."
+number = "Optional issue/PR number override. Default is the inbound thread (PR for PR conversations/reviews, originating issue otherwise)."
 
 [gh_push_branch]
 description = "Push the workspace branch to origin. Uses credentials configured by the orchestrator."

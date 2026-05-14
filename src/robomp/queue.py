@@ -188,6 +188,7 @@ class WorkerPool:
                 github=self.github,
                 sandbox=self.sandbox,
                 payload=row.payload,
+                delivery_id=row.delivery_id,
             )
         elif event == "issue_comment" and action == "created":
             issue = row.payload.get("issue") or {}
@@ -198,6 +199,7 @@ class WorkerPool:
                     github=self.github,
                     sandbox=self.sandbox,
                     payload=row.payload,
+                    delivery_id=row.delivery_id,
                 )
             else:
                 await tasks.handle_comment(
@@ -206,6 +208,7 @@ class WorkerPool:
                     github=self.github,
                     sandbox=self.sandbox,
                     payload=row.payload,
+                    delivery_id=row.delivery_id,
                 )
         elif event == "pull_request_review_comment" and action == "created":
             await tasks.handle_review(
@@ -214,6 +217,7 @@ class WorkerPool:
                 github=self.github,
                 sandbox=self.sandbox,
                 payload=row.payload,
+                delivery_id=row.delivery_id,
             )
         elif event == "issues" and action == "closed":
             await tasks.cleanup_workspace(

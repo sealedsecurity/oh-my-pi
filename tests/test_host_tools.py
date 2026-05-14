@@ -136,6 +136,69 @@ def test_gh_post_comment_validates_body(db: Database, tmp_path: Path) -> None:
         _stop_loop(loop, t)
 
 
+def test_gh_post_comment_defaults_to_inbound_pr_thread(db: Database, tmp_path: Path) -> None:
+    """PR conversation/review tasks set inbound_thread_number to the PR; the
+    agent's reply must land on that PR by default, not the originating issue."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        return httpx.Response(201, json={"id": 7, "user": {"login": "robomp-bot"}, "body": "hi", "created_at": "t"})
+
+    transport = httpx.MockTransport(handler)
+    github = GitHubClient("token", transport=transport)
+    loop, thread = _make_loop_in_background()
+    bindings = ToolBindings(
+        db=db,
+        github=github,
+        repo=_stub_repo(),
+        issue=_stub_issue(),  # issue #42
+        workspace=_stub_workspace(tmp_path),
+        loop=loop,
+        author_name="robomp-bot",
+        author_email="robomp-bot@example.invalid",
+        inbound_thread_number=99,  # PR #99 that fixes issue #42
+    )
+    try:
+        tool = next(x for x in build(bindings) if x.name == "gh_post_comment")
+        tool.execute({"body": "hi"}, _ctx())
+    finally:
+        _stop_loop(loop, thread)
+
+    assert captured["url"].endswith("/repos/octo/widget/issues/99/comments"), captured["url"]
+
+
+def test_gh_post_comment_explicit_number_overrides_inbound(db: Database, tmp_path: Path) -> None:
+    """An explicit `number` arg still wins over the inbound default."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        return httpx.Response(201, json={"id": 7, "user": {"login": "robomp-bot"}, "body": "hi", "created_at": "t"})
+
+    transport = httpx.MockTransport(handler)
+    github = GitHubClient("token", transport=transport)
+    loop, thread = _make_loop_in_background()
+    bindings = ToolBindings(
+        db=db,
+        github=github,
+        repo=_stub_repo(),
+        issue=_stub_issue(),
+        workspace=_stub_workspace(tmp_path),
+        loop=loop,
+        author_name="robomp-bot",
+        author_email="robomp-bot@example.invalid",
+        inbound_thread_number=99,
+    )
+    try:
+        tool = next(x for x in build(bindings) if x.name == "gh_post_comment")
+        tool.execute({"body": "hi", "number": 42}, _ctx())
+    finally:
+        _stop_loop(loop, thread)
+
+    assert captured["url"].endswith("/repos/octo/widget/issues/42/comments"), captured["url"]
+
+
 def test_gh_post_comment_propagates_github_error(db: Database, tmp_path: Path) -> None:
     transport = httpx.MockTransport(lambda r: httpx.Response(422, json={"message": "Validation failed"}))
     bindings, loop, t = _bindings(db, tmp_path, transport)

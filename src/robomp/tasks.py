@@ -54,7 +54,15 @@ def _directive_from_payload(payload: Mapping[str, Any]) -> DirectiveInfo | None:
         return None
     if not isinstance(author, str) or not author.strip():
         return None
-    return DirectiveInfo(body=body, author=author)
+    pragmas: list[tuple[str, str]] = []
+    raw_pragmas = raw.get("pragmas")
+    if isinstance(raw_pragmas, list):
+        for entry in raw_pragmas:
+            if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                k, v = entry
+                if isinstance(k, str) and isinstance(v, str):
+                    pragmas.append((k, v))
+    return DirectiveInfo(body=body, author=author, pragmas=tuple(pragmas))
 
 
 async def _fetch_thread(
@@ -150,7 +158,7 @@ async def _attach_thread(
     if directive is None:
         return None
     thread = await _fetch_thread(github, repo, number, is_pr=is_pr)
-    return DirectiveInfo(body=directive.body, author=directive.author, thread=thread)
+    return DirectiveInfo(body=directive.body, author=directive.author, thread=thread, pragmas=directive.pragmas)
 
 
 async def _resolve_repo_and_issue(
@@ -174,6 +182,7 @@ async def triage_issue(
     github: GitHubClient,
     sandbox: SandboxManager,
     payload: Mapping[str, Any],
+    delivery_id: str,
 ) -> None:
     repo, issue = await _resolve_repo_and_issue(github, payload)
     if issue.is_pull_request:
@@ -210,6 +219,7 @@ async def triage_issue(
         repo=repo,
         issue=issue,
         workspace=workspace,
+        delivery_id=delivery_id,
     )
     await run_task(task_kind="triage_issue", inputs=inputs)
 
@@ -221,6 +231,7 @@ async def handle_comment(
     github: GitHubClient,
     sandbox: SandboxManager,
     payload: Mapping[str, Any],
+    delivery_id: str,
 ) -> None:
     repo, issue = await _resolve_repo_and_issue(github, payload)
     key = issue_key(repo.full_name, issue.number)
@@ -266,6 +277,7 @@ async def handle_comment(
             repo=repo,
             issue=issue,
             workspace=workspace,
+            delivery_id=delivery_id,
         )
         directive = await _attach_thread(github, directive, repo.full_name, issue.number, is_pr=False)
         await run_task(task_kind="triage_issue", inputs=inputs, directive=directive)
@@ -312,6 +324,7 @@ async def handle_comment(
             repo=repo,
             issue=issue,
             workspace=workspace,
+            delivery_id=delivery_id,
         )
         directive = await _attach_thread(github, directive, repo.full_name, issue.number, is_pr=False)
         await run_task(task_kind="handle_comment", inputs=inputs, comment=comment, directive=directive)
@@ -334,6 +347,7 @@ async def handle_comment(
         repo=repo,
         issue=issue,
         workspace=workspace,
+        delivery_id=delivery_id,
     )
     directive = await _attach_thread(github, directive, repo.full_name, issue.number, is_pr=False)
     await run_task(task_kind="handle_comment", inputs=inputs, comment=comment, directive=directive)
@@ -346,6 +360,7 @@ async def handle_review(
     github: GitHubClient,
     sandbox: SandboxManager,
     payload: Mapping[str, Any],
+    delivery_id: str,
 ) -> None:
     pr = payload.get("pull_request") or {}
     pr_number = int(pr.get("number") or 0)
@@ -400,6 +415,7 @@ async def handle_review(
         repo=repo,
         issue=issue,
         workspace=workspace,
+        delivery_id=delivery_id,
     )
     await run_task(
         task_kind="handle_review",
@@ -416,6 +432,7 @@ async def handle_pr_conversation(
     github: GitHubClient,
     sandbox: SandboxManager,
     payload: Mapping[str, Any],
+    delivery_id: str,
 ) -> None:
     """Handle a regular (non-review) comment on a bot-authored PR.
 
@@ -501,6 +518,7 @@ async def handle_pr_conversation(
         repo=repo,
         issue=issue,
         workspace=workspace,
+        delivery_id=delivery_id,
     )
     directive = await _attach_thread(github, directive, repo_full, pr_number, is_pr=True)
     await run_task(task_kind="handle_comment", inputs=inputs, comment=comment, pr_number=pr_number, directive=directive)

@@ -1,10 +1,11 @@
-# Directive on {{repo.full_name}}#{{issue.number}}
+# Directive on {{repo.full_name}}#{{inbound.number}} ({{inbound.kind}})
 
 **@{{directive.author}}** posted an authoritative directive on this
-issue/PR. They're either a maintainer who tagged you (`@bot`) or a
-configured reviewer bot whose comments you treat as binding. Current PR
-state: `{{state.pr_status}}`. The directive overrides any prior plan
-or seed todos.
+{{inbound.kind}} thread (originating issue #{{issue.number}}). They're
+either a maintainer who tagged you (`@bot`) or a configured reviewer bot
+whose comments you treat as binding. Current PR state:
+`{{state.pr_status}}`. The directive overrides any prior plan or seed
+todos.
 
 ---
 

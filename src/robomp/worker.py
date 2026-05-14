@@ -24,7 +24,7 @@ from omp_rpc import (
     ToolExecutionEndEvent,
 )
 
-from robomp import host_tools, persona
+from robomp import host_tools, persona, pragmas
 from robomp.cancellation import register_cancel_hook, unregister_cancel_hook
 from robomp.config import Settings
 from robomp.db import Database, issue_key
@@ -45,6 +45,7 @@ class TaskInputs:
     repo: RepoInfo
     issue: IssueInfo
     workspace: Workspace
+    delivery_id: str
 
 
 @dataclass(slots=True, frozen=True)
@@ -71,6 +72,26 @@ class DirectiveInfo:
     body: str
     author: str
     thread: tuple[ThreadMessage, ...] = ()
+    pragmas: tuple[tuple[str, str], ...] = ()
+
+
+def _resolve_pragma_overrides(
+    directive: DirectiveInfo | None,
+    settings: Settings,
+) -> tuple[str | None, pragmas.ThinkingLevel | None]:
+    """Return `(model_override, thinking_override)` for the current directive.
+
+    `None` for either means "no override, use the settings default". Aliases
+    that don't match anything in the pool / level set are dropped (caller logs
+    the discard at the callsite that has access to issue_key).
+    """
+    if directive is None or not directive.pragmas:
+        return None, None
+    model_value = pragmas.pragma_value(directive.pragmas, "model")
+    thinking_value = pragmas.pragma_value(directive.pragmas, "thinking")
+    model_override = pragmas.resolve_model_alias(model_value, settings.model_pool) if model_value else None
+    thinking_override = pragmas.resolve_thinking_level(thinking_value) if thinking_value else None
+    return model_override, thinking_override
 
 
 def _build_extra_env(settings: Settings) -> dict[str, str]:
@@ -118,6 +139,7 @@ def _build_prompt(
                 comment=comment,
                 directive=directive,
                 pr_status=pr_status,
+                pr_number=pr_number,
             )
         return persona.followup_comment(
             repo=inputs.repo,
@@ -125,6 +147,7 @@ def _build_prompt(
             workspace=inputs.workspace,
             comment=comment,
             pr_status=pr_status,
+            pr_number=pr_number,
         )
     if task_kind == "handle_review":
         assert review_payload is not None
@@ -158,6 +181,7 @@ def _run_rpc_blocking(
     prompt: str,
     loop: asyncio.AbstractEventLoop,
     bindings: ToolBindings,
+    directive: DirectiveInfo | None = None,
 ) -> str | None:
     """Run a full RPC turn synchronously. Returns final assistant text (or None)."""
     settings = inputs.settings
@@ -182,15 +206,21 @@ def _run_rpc_blocking(
             log.debug("delta", extra={"issue": bindings.issue_key, "delta": str(ev.get("delta", ""))[:200]})
 
     rpc_env = _build_extra_env(settings)
-    chosen_model = settings.pick_model()
+    model_override, thinking_override = _resolve_pragma_overrides(directive, settings)
+    chosen_model = model_override or settings.pick_model()
+    chosen_thinking = thinking_override or settings.thinking_level
     log.info(
         "rpc_model_pick",
         extra={
             "issue": bindings.issue_key,
             "model": chosen_model,
             "pool": list(settings.model_pool),
+            "thinking": chosen_thinking,
+            "pragma_model": model_override,
+            "pragma_thinking": thinking_override,
         },
     )
+    inputs.db.set_event_model(inputs.delivery_id, chosen_model)
 
     with RpcClient(
         executable=settings.omp_command,
@@ -201,7 +231,7 @@ def _run_rpc_blocking(
         no_title=True,
         model=chosen_model,
         provider=settings.provider,
-        thinking=settings.thinking_level if settings.thinking_level != "off" else None,
+        thinking=chosen_thinking if chosen_thinking != "off" else None,
         append_system_prompt=persona.system_append(repo=inputs.repo, issue=inputs.issue, workspace=inputs.workspace),
         custom_tools=host_tools.build(bindings),
         request_timeout=settings.request_timeout_seconds,
@@ -289,6 +319,7 @@ async def run_task(
         loop=loop,
         author_name=inputs.settings.resolved_author_name,
         author_email=inputs.settings.git_author_email,
+        inbound_thread_number=pr_number,
     )
     prompt = _build_prompt(
         task_kind, inputs, comment=comment, pr_number=pr_number, review_payload=review_payload, directive=directive
@@ -300,6 +331,7 @@ async def run_task(
         prompt=prompt,
         loop=loop,
         bindings=bindings,
+        directive=directive,
     )
 
 

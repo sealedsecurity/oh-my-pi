@@ -668,3 +668,67 @@ def test_route_reviewer_bot_login_case_insensitive() -> None:
     )
     assert decision.directive is True
     assert decision.directive_author == "chatgpt-codex-connector"
+
+
+def test_route_directive_strips_pragmas_from_maintainer_comment() -> None:
+    decision = route(
+        "issue_comment",
+        {
+            "action": "created",
+            "comment": {
+                "user": {"login": "can1357"},
+                "author_association": "OWNER",
+                "body": "@robomp-bot /model gpt /thinking low\nrefactor X",
+            },
+            "issue": {"number": 9},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert decision.directive is True
+    assert decision.directive_body == "refactor X"
+    assert decision.directive_pragmas == (("model", "gpt"), ("thinking", "low"))
+
+
+def test_route_directive_strips_pragmas_from_reviewer_bot_comment() -> None:
+    decision = route(
+        "issue_comment",
+        {
+            "action": "created",
+            "comment": {
+                "user": {"login": "chatgpt-codex-connector", "type": "Bot"},
+                "body": "/model claude\nLeak in foo()",
+            },
+            "issue": {"number": 9, "pull_request": {"url": "x"}},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        reviewer_bots=frozenset({"chatgpt-codex-connector"}),
+        resolve_issue_from_pr=lambda _r, _n: "octo/widget#42",
+    )
+    assert decision.directive is True
+    assert decision.directive_body == "Leak in foo()"
+    assert decision.directive_pragmas == (("model", "claude"),)
+
+
+def test_route_non_directive_comment_carries_no_pragmas() -> None:
+    # Random user pragmas must NOT propagate — only directive comments do.
+    decision = route(
+        "issue_comment",
+        {
+            "action": "created",
+            "comment": {
+                "user": {"login": "stranger"},
+                "author_association": "NONE",
+                "body": "/model gpt\nhello",
+            },
+            "issue": {"number": 9},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert decision.directive is False
+    assert decision.directive_pragmas == ()

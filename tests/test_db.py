@@ -180,6 +180,58 @@ def test_migration_adds_classification_to_existing_db(tmp_path: Path) -> None:
     database.close()
 
 
+def test_set_event_model_persists_on_running_event(db: Database) -> None:
+    """`set_event_model` writes the picked model so the dashboard can attribute behavior."""
+    db.record_event(
+        delivery_id="d-model",
+        event_type="issues",
+        repo="octo/widget",
+        issue_key=issue_key("octo/widget", 42),
+        payload={"action": "opened"},
+    )
+    row = db.claim_next_event()
+    assert row is not None and row.delivery_id == "d-model"
+    db.set_event_model("d-model", "claude-sonnet-4-5")
+    running = db.list_running_events()
+    assert len(running) == 1
+    assert running[0]["model"] == "claude-sonnet-4-5"
+    # Setting a different model later (e.g. retry) overwrites in place.
+    db.set_event_model("d-model", "claude-opus-4-5")
+    running = db.list_running_events()
+    assert running[0]["model"] == "claude-opus-4-5"
+
+
+def test_list_running_events_surfaces_last_tool_since_start(db: Database) -> None:
+    """`list_running_events` joins the most recent tool_call newer than `started_at`.
+
+    Tool calls logged before the current run (e.g. an earlier triage on the same
+    issue) MUST NOT be reported as the current activity.
+    """
+    key = issue_key("octo/widget", 7)
+    db.upsert_issue(key=key, repo="octo/widget", number=7, state="reproducing")
+    # Stale tool call from a previous run (no started_at yet).
+    db.log_tool_call(issue_key=key, tool="stale_tool", args={})
+    db.record_event(
+        delivery_id="d-7",
+        event_type="issues",
+        repo="octo/widget",
+        issue_key=key,
+        payload={"action": "opened"},
+    )
+    db.claim_next_event()  # sets started_at
+    # Before any current-run tool call: last_tool must be NULL, not "stale_tool".
+    running = db.list_running_events()
+    assert len(running) == 1
+    assert running[0]["last_tool"] is None
+    assert running[0]["last_tool_ts"] is None
+    # New tool call after start → surfaces in the snapshot.
+    db.log_tool_call(issue_key=key, tool="gh_post_comment", args={"body": "hi"})
+    db.log_tool_call(issue_key=key, tool="set_issue_labels", args={"labels": ["bug"]})
+    running = db.list_running_events()
+    assert running[0]["last_tool"] == "set_issue_labels"  # latest by ts
+    assert running[0]["last_tool_ts"] is not None
+
+
 def test_record_submission_dedupes_by_delivery(db: Database) -> None:
     assert db.record_submission(delivery_id="d-1", login="Alice", repo="octo/widget")
     # Retry of the same delivery id is a no-op (idempotent webhook delivery).
