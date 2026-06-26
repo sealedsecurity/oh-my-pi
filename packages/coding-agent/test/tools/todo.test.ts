@@ -4,7 +4,9 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import {
+	markdownToPhases,
 	nextActionableTask,
+	phasesToMarkdown,
 	resolveTodoMarkdownPath,
 	TODO_STRIKE_HOLD_FRAMES,
 	type TodoPhase,
@@ -191,6 +193,54 @@ describe("TodoTool operations", () => {
 			{ content: "First", status: "in_progress" },
 			{ content: "Second", status: "pending" },
 		]);
+	});
+
+	it("blocks a task (excluded from remaining, counted distinctly) and unblocks it", async () => {
+		const tool = new TodoTool(createSession());
+		await tool.execute("call-1", { op: "init", list: [{ phase: "Work", items: ["a", "b"] }] });
+
+		const blocked = await tool.execute("call-2", { op: "block", task: "b", reason: "waiting on sign-off" });
+		const bTask = blocked.details?.phases[0]?.tasks.find(task => task.content === "b");
+		expect(bTask?.status).toBe("blocked");
+		expect(bTask?.blocker).toBe("waiting on sign-off");
+		const summary = blocked.content.find(part => part.type === "text");
+		if (summary?.type !== "text") throw new Error("Expected text summary from todo");
+		// `a` stays the only open item; `b` leaves the remaining/open set but is surfaced as blocked.
+		expect(summary.text).toContain("Remaining items (1):");
+		expect(summary.text).toContain("1 blocked");
+
+		const unblocked = await tool.execute("call-3", { op: "unblock", task: "b" });
+		const bAfter = unblocked.details?.phases[0]?.tasks.find(task => task.content === "b");
+		expect(bAfter?.status).toBe("pending");
+		expect(bAfter?.blocker).toBeUndefined();
+	});
+
+	it("does not auto-promote a blocked task to in_progress", async () => {
+		const tool = new TodoTool(createSession());
+		await tool.execute("call-1", { op: "init", list: [{ phase: "Work", items: ["only"] }] });
+
+		const result = await tool.execute("call-2", { op: "block", task: "only" });
+
+		// `only` was in_progress; blocking it leaves no pending/in_progress, so normalization must not revive it.
+		expect(result.details?.phases[0]?.tasks[0]?.status).toBe("blocked");
+	});
+
+	it("preserves blocked status across the markdown round-trip", () => {
+		const phases: TodoPhase[] = [
+			{
+				name: "Work",
+				tasks: [
+					{ content: "a", status: "blocked", blocker: "x" },
+					{ content: "b", status: "completed" },
+				],
+			},
+		];
+		const md = phasesToMarkdown(phases);
+		expect(md).toContain("- [!] a");
+
+		const { phases: parsed, errors } = markdownToPhases(md);
+		expect(errors).toEqual([]);
+		expect(parsed[0]?.tasks.find(task => task.content === "a")?.status).toBe("blocked");
 	});
 
 	it("creates a phase when append targets a missing phase", async () => {

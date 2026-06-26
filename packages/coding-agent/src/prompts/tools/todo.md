@@ -11,6 +11,8 @@ On each completion the earliest still-open task (in phase order) auto-promotes t
 |`start`|`task`|Mark in progress|
 |`done`|`task` or `phase`|Mark completed|
 |`drop`|`task` or `phase`|Mark abandoned|
+|`block`|`task` or `phase`, optional `reason`|Mark **blocked** — open but waiting on external input; excluded from the stop-time incomplete-todo reminder|
+|`unblock`|`task` or `phase`|Return a blocked task to `pending`|
 |`rm`|`task` or `phase` (optional)|Remove task or phase's tasks; omit both to clear the list|
 |`append`|`phase`, `items: string[]`|Append tasks to `phase`; lazily creates phase|
 |`view`|—|Read-only: echo the list, no modify|
@@ -22,7 +24,7 @@ On each completion the earliest still-open task (in phase order) auto-promotes t
 ## Rules
 - Mark tasks done immediately after finishing.
 - Complete phases in order.
-- Blocked? `append` a task to the active phase to unblock, or `drop`.
+- Waiting on something you can't act on (a user decision, another agent, an external service)? `block` the task (optional `reason`) — it stays in the tracker but won't trip the stop reminder; `unblock` when it's actionable again. If the blocker is itself agent-actionable, `append` an unblocking task instead.
 - Keep `task`/`phase` strings stable once introduced.
 - Lost the exact task text? `view` echoes the list — NEVER guess from memory; a mismatched `task` string is an error.
 

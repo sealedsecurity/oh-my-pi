@@ -18,13 +18,15 @@ import { formatErrorDetail, PREVIEW_LIMITS } from "./render-utils";
 // Types
 // =============================================================================
 
-export type TodoStatus = "pending" | "in_progress" | "completed" | "abandoned";
+export type TodoStatus = "pending" | "in_progress" | "completed" | "abandoned" | "blocked";
 /** Operation names accepted by the todo tool and echoed in successful result details. */
-export type TodoOperation = "init" | "start" | "done" | "rm" | "drop" | "append" | "view";
+export type TodoOperation = "init" | "start" | "done" | "rm" | "drop" | "block" | "unblock" | "append" | "view";
 
 export interface TodoItem {
 	content: string;
 	status: TodoStatus;
+	/** When `status === "blocked"`, an optional note on what the task is waiting for. */
+	blocker?: string;
 }
 
 export interface TodoPhase {
@@ -49,7 +51,9 @@ export interface TodoToolDetails {
 // Schema
 // =============================================================================
 
-const TodoOp = type('"init" | "start" | "done" | "rm" | "drop" | "append" | "view"').describe("operation to apply");
+const TodoOp = type('"init" | "start" | "done" | "rm" | "drop" | "block" | "unblock" | "append" | "view"').describe(
+	"operation to apply",
+);
 
 const InitListEntry = type({
 	phase: type("string").describe("phase name"),
@@ -65,6 +69,7 @@ const todoSchema = type({
 	// and both enforce non-empty with op-specific errors. A stray `items: []` on
 	// an op that ignores it (e.g. `view`) must not be a hard schema rejection.
 	"items?": type("string").describe("task content").array().describe("tasks to append"),
+	"reason?": type("string").describe("blocker note (block op)"),
 }).describe("apply a single todo operation");
 
 type TodoParams = TodoSchema;
@@ -89,7 +94,9 @@ function findPhaseByName(phases: TodoPhase[], name: string): TodoPhase | undefin
 }
 
 function cloneTask(task: TodoItem): TodoItem {
-	return { content: task.content, status: task.status };
+	return task.blocker !== undefined
+		? { content: task.content, status: task.status, blocker: task.blocker }
+		: { content: task.content, status: task.status };
 }
 
 function clonePhases(phases: TodoPhase[]): TodoPhase[] {
@@ -382,6 +389,23 @@ function applyEntry(phases: TodoPhase[], entry: TodoOpEntryValue, errors: string
 			}
 			return phases;
 		}
+		case "block": {
+			const reason = entry.reason?.trim() || undefined;
+			for (const task of getTaskTargets(phases, entry, errors)) {
+				task.status = "blocked";
+				task.blocker = reason;
+			}
+			return phases;
+		}
+		case "unblock": {
+			for (const task of getTaskTargets(phases, entry, errors)) {
+				if (task.status === "blocked") {
+					task.status = "pending";
+					task.blocker = undefined;
+				}
+			}
+			return phases;
+		}
 		case "rm":
 			return removeTasks(phases, entry, errors);
 		case "append":
@@ -421,6 +445,7 @@ const STATUS_TO_MARKER: Record<TodoStatus, string> = {
 	in_progress: "/",
 	completed: "x",
 	abandoned: "-",
+	blocked: "!",
 };
 
 export function resolveTodoMarkdownPath(input: string, cwd: string): string {
@@ -451,6 +476,7 @@ const MARKER_TO_STATUS: Record<string, TodoStatus> = {
 	">": "in_progress",
 	"-": "abandoned",
 	"~": "abandoned",
+	"!": "blocked",
 };
 
 /** Parse a Markdown checklist back into todo phases. */
@@ -482,7 +508,7 @@ export function markdownToPhases(md: string): { phases: TodoPhase[]; errors: str
 			const marker = taskMatch[1];
 			const status = MARKER_TO_STATUS[marker];
 			if (!status) {
-				errors.push(`Line ${lineNum + 1}: unknown status marker "[${marker}]" (use [ ], [x], [/], [-])`);
+				errors.push(`Line ${lineNum + 1}: unknown status marker "[${marker}]" (use [ ], [x], [/], [-], [!])`);
 				continue;
 			}
 			currentPhase.tasks.push({ content: taskMatch[2].trim(), status });
@@ -530,6 +556,7 @@ function formatSummary(phases: TodoPhase[], errors: string[], readOnly = false):
 	}
 	// Closed = completed + abandoned, mirroring the per-phase `done` count.
 	const closedAll = tasks.filter(task => task.status === "completed" || task.status === "abandoned").length;
+	const blockedAll = tasks.filter(task => task.status === "blocked").length;
 	// The active phase is the EARLIEST one still holding open work, so the
 	// in-progress pointer can sit in a phase whose successors already have
 	// completed tasks. Detect that "worked ahead" case to explain the
@@ -539,7 +566,9 @@ function formatSummary(phases: TodoPhase[], errors: string[], readOnly = false):
 		(phase, idx) =>
 			idx > currentIdx && phase.tasks.some(task => task.status === "completed" || task.status === "abandoned"),
 	);
-	lines.push(`Overall: ${closedAll}/${tasks.length} done, ${remainingTasks.length} open.`);
+	lines.push(
+		`Overall: ${closedAll}/${tasks.length} done, ${remainingTasks.length} open${blockedAll > 0 ? `, ${blockedAll} blocked` : ""}.`,
+	);
 	lines.push(
 		`Active phase ${currentIdx + 1}/${phases.length} "${current.name}" (${done}/${current.tasks.length})${
 			workedAhead
@@ -551,7 +580,16 @@ function formatSummary(phases: TodoPhase[], errors: string[], readOnly = false):
 		lines.push(`  ${phase.name}:`);
 		for (const task of phase.tasks) {
 			const checkbox = task.status === "completed" ? "[X]" : "[ ]";
-			const tag = task.status === "in_progress" ? " (in progress)" : task.status === "abandoned" ? " (dropped)" : "";
+			const tag =
+				task.status === "in_progress"
+					? " (in progress)"
+					: task.status === "abandoned"
+						? " (dropped)"
+						: task.status === "blocked"
+							? task.blocker
+								? ` (blocked: ${task.blocker})`
+								: " (blocked)"
+							: "";
 			lines.push(`    - ${checkbox} ${task.content}${tag}`);
 		}
 	}
