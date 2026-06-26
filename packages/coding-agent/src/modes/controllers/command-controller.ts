@@ -897,6 +897,41 @@ export class CommandController {
 		this.ctx.showStatus(`Fresh provider session started (${result.closedProviderSessions} ${stateLabel} pruned).`);
 	}
 
+	async handleClearContextCommand(): Promise<void> {
+		if (this.ctx.session.isCompacting) {
+			this.ctx.session.abortCompaction();
+			while (this.ctx.session.isCompacting) {
+				await Bun.sleep(10);
+			}
+		}
+		const result = await this.ctx.session.clearSessionContext();
+		if (!result) {
+			this.ctx.showWarning("Wait for the current response to finish or abort it before clearing the context.");
+			return;
+		}
+		// Drop the rendered transcript so the UI matches the now-empty model
+		// context (mirrors #runNewSessionFlow's container teardown, minus the
+		// new session — the session id, title, and transcript file all survive).
+		this.ctx.chatContainer.clear();
+		this.ctx.pendingMessagesContainer.clear();
+		this.ctx.compactionQueuedMessages = [];
+		this.ctx.streamingComponent = undefined;
+		this.ctx.streamingMessage = undefined;
+		this.ctx.pendingTools.clear();
+		this.ctx.statusLine.invalidate();
+		this.ctx.updateEditorTopBorder();
+		const noun = result.droppedCount === 1 ? "message" : "messages";
+		this.ctx.present([
+			new Spacer(1),
+			new Text(
+				`${theme.fg("accent", `${theme.status.success} Context cleared — ${result.droppedCount} ${noun} dropped; session continues.`)}`,
+				1,
+				1,
+			),
+		]);
+		this.ctx.ui.requestRender(true, { clearScrollback: true });
+	}
+
 	async handleDropCommand(): Promise<void> {
 		if (!this.ctx.sessionManager.getSessionFile()) {
 			this.ctx.showError("Nothing to drop (in-memory session)");

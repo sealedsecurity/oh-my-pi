@@ -836,6 +836,11 @@ export interface FreshSessionResult {
 	closedProviderSessions: number;
 }
 
+export interface ClearSessionContextResult {
+	/** Number of live messages dropped from the model's context. */
+	droppedCount: number;
+}
+
 /** Internal marker for hook messages queued through the agent loop */
 // ============================================================================
 // Constants
@@ -5264,6 +5269,50 @@ export class AgentSession {
 			sessionId: this.sessionId,
 			closedProviderSessions,
 		};
+	}
+
+	/**
+	 * Reset the current conversation in place: drop every message, queued turn,
+	 * and pending tool call from the model's context while keeping the session
+	 * itself — its id, title, cwd, model, settings, and on-disk transcript all
+	 * survive. The next turn is sent with only the base system prompt plus the
+	 * project rules/AGENTS.md.
+	 *
+	 * This is the in-place sibling of {@link newSession}: it reuses the same
+	 * conversation-boundary teardown (drop the conversation, rotate provider-side
+	 * session state so providers that keep history server-side resume nothing,
+	 * re-prime the advisor, and undo any memory promotion) but skips minting a new
+	 * session id and opening a fresh transcript file. Unlike {@link freshSession}
+	 * (which only rotates provider stream state) it also clears the conversation.
+	 *
+	 * Returns `undefined` without mutating anything while a response is streaming.
+	 */
+	async clearSessionContext(): Promise<ClearSessionContextResult | undefined> {
+		if (this.isStreaming) return undefined;
+		const droppedCount = this.agent.state.messages.length;
+
+		// Drop the conversation: messages, queued steers/follow-ups, pending tool
+		// calls, and error state. agent.reset() keeps the model and system prompt.
+		this.agent.reset();
+		this.#pendingNextTurnMessages = [];
+		this.#scheduledHiddenNextTurnGeneration = undefined;
+
+		// Rotate provider-side session state so a provider that keeps conversation
+		// history server-side starts a brand-new exchange rather than resuming the
+		// context we just dropped (mirrors freshSession).
+		this.#closeAllProviderSessions("clear context");
+		this.#freshProviderSessionId = Bun.randomUUIDv7();
+		this.#syncAgentSessionId();
+		this.#rekeyHindsightMemoryForCurrentSessionId();
+		this.#rekeyMnemopiMemoryForCurrentSessionId();
+		this.agent.appendOnlyContext?.invalidateForModelChange();
+
+		// Re-prime the advisor across the conversation boundary and undo any memory
+		// promotion so the next turn rebuilds from the base system prompt.
+		this.#resetAdvisorSessionState();
+		await this.#resetMemoryContextForNewTranscript();
+
+		return { droppedCount };
 	}
 
 	// =========================================================================
