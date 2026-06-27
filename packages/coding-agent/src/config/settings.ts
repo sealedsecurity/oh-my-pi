@@ -33,6 +33,7 @@ import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset }
 import { AgentStorage } from "../session/agent-storage";
 import { normalizeToolName } from "../tools/builtin-names";
 import { type EditMode, normalizeEditMode } from "../utils/edit-mode";
+import { atomicWriteThroughSymlink } from "./atomic-write";
 import { withFileLock } from "./file-lock";
 import {
 	type BashInterceptorRule,
@@ -1294,7 +1295,7 @@ export class Settings {
 
 				// Update our global with any external changes we preserved
 				this.#global = current;
-				await Bun.write(configPath, YAML.stringify(this.#global, null, 2));
+				await atomicWriteThroughSymlink(configPath, YAML.stringify(this.#global, null, 2));
 			});
 		} catch (error) {
 			logger.warn("Settings: save failed", { error: String(error) });
