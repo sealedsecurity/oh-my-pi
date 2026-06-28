@@ -322,6 +322,7 @@ import {
 	demoteInterruptedThinking,
 	INTERRUPTED_THINKING_MESSAGE_TYPE,
 	type InterruptedThinkingDetails,
+	isEmptyErrorTurn,
 	isUserInterruptAbort,
 	type PythonExecutionMessage,
 	readQueueChipText,
@@ -2955,6 +2956,7 @@ export class AgentSession {
 		if (message.role === "assistant") {
 			const assistantMsg = message as AssistantMessage;
 			if (this.#isClassifierRefusal(assistantMsg)) return;
+			if (isEmptyErrorTurn(assistantMsg)) return;
 			if (assistantMsg.stopReason !== "aborted" && assistantMsg.stopReason !== "error" && assistantMsg.usage) {
 				assistantMsg.contextSnapshot = {
 					promptTokens: calculatePromptTokens(assistantMsg.usage),
