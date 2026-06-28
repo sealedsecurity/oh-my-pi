@@ -22,6 +22,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { effectiveReserveTokens, estimateTokens, prepareCompaction } from "@oh-my-pi/pi-agent-core/compaction";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -240,5 +241,61 @@ describe("AgentSession snapcompact frame-budget sizing", () => {
 		// even though one frame charge would overflow the budget — the
 		// text-only `planArchive` path makes this case recoverable.
 		expect(opts?.maxFrames).toBe(1);
+	});
+
+	it("caps snapcompact frames by the provider image-byte budget on large-window models", async () => {
+		// The wedge scenario: a large-window vision model admits ~MAX_FRAMES_DEFAULT
+		// frames token-wise, but their summed base64 busts the provider request-size
+		// limit and 413s the session. The byte budget must bind below the token cap.
+		const bigModel = buildModel({
+			id: "claude-opus-4-8",
+			name: "claude-opus-4-8",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			baseUrl: "https://api.anthropic.com",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 2_000_000,
+			maxTokens: 8192,
+		});
+		const agent = new Agent({
+			initialState: { model: bigModel, systemPrompt: ["Test"], tools: [], messages: [] },
+		});
+		const bigSession = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({
+				"compaction.strategy": "snapcompact",
+				"compaction.autoContinue": false,
+				"compaction.keepRecentTokens": 4000,
+			}),
+			modelRegistry,
+		});
+
+		try {
+			const branchEntries = sessionManager.getBranch();
+			const firstKeptEntry = branchEntries[branchEntries.length - 1];
+			if (!firstKeptEntry?.id) throw new Error("Expected branch entry with id");
+
+			const compactSpy = vi.spyOn(snapcompact, "compact").mockResolvedValue({
+				summary: "stubbed snapcompact",
+				shortSummary: "stub",
+				firstKeptEntryId: firstKeptEntry.id,
+				tokensBefore: 1000,
+				details: { readFiles: [], modifiedFiles: [] },
+				preserveData: { snapcompact: { frames: [], totalChars: 0, truncatedChars: 0 } },
+			});
+
+			await bigSession.compact(undefined, { mode: "snapcompact" });
+
+			expect(compactSpy).toHaveBeenCalledTimes(1);
+			const maxFrames = compactSpy.mock.calls[0]?.[1]?.maxFrames;
+			const byteCap = Math.floor(snapcompact.providerImageByteBudget("anthropic") / snapcompact.FRAME_BYTE_ESTIMATE);
+			expect(byteCap).toBeLessThan(snapcompact.MAX_FRAMES_DEFAULT);
+			expect(maxFrames).toBe(byteCap);
+		} finally {
+			await bigSession.dispose();
+		}
 	});
 });

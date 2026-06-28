@@ -10886,7 +10886,17 @@ export class AgentSession {
 	 */
 	#computeSnapcompactMaxFrames(preparation: CompactionPreparation, settings: CompactionSettings): number {
 		const ctxWindow = this.model?.contextWindow ?? 0;
-		if (ctxWindow <= 0) return snapcompact.MAX_FRAMES_DEFAULT;
+		// Also cap frames by the provider's image-BYTE budget. A large context
+		// window admits ~MAX_FRAMES_DEFAULT frames token-wise, but their summed
+		// base64 (~FRAME_BYTE_ESTIMATE each) can bust the provider request-size
+		// limit and 413 the session (79 frames / ~14 MB observed). Lowering the
+		// cap makes the planner foveate the archive (down-rez the dense middle,
+		// drop the oldest slice) to fit the byte budget at compaction time.
+		const byteFrameCap = Math.max(
+			1,
+			Math.floor(snapcompact.providerImageByteBudget(this.model?.provider) / snapcompact.FRAME_BYTE_ESTIMATE),
+		);
+		if (ctxWindow <= 0) return Math.min(snapcompact.MAX_FRAMES_DEFAULT, byteFrameCap);
 		const reserve = effectiveReserveTokens(ctxWindow, settings);
 		let baseTokens = computeNonMessageTokens(this);
 		for (const message of preparation.recentMessages) {
@@ -10925,7 +10935,11 @@ export class AgentSession {
 		const capReserve = textEdgeTokens + SUMMARY_TEMPLATE_TOKENS;
 		const frameBudget = totalBudget - baseTokens - capReserve;
 		if (frameBudget < snapcompact.FRAME_TOKEN_ESTIMATE) return 1;
-		return Math.min(Math.floor(frameBudget / snapcompact.FRAME_TOKEN_ESTIMATE), snapcompact.MAX_FRAMES_DEFAULT);
+		return Math.min(
+			Math.floor(frameBudget / snapcompact.FRAME_TOKEN_ESTIMATE),
+			snapcompact.MAX_FRAMES_DEFAULT,
+			byteFrameCap,
+		);
 	}
 
 	/**

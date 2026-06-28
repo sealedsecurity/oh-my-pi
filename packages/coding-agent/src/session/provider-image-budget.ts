@@ -7,22 +7,34 @@ import type {
 	ToolResultMessage,
 	UserMessage,
 } from "@oh-my-pi/pi-ai";
-import { providerImageBudget } from "@oh-my-pi/snapcompact";
+import { providerImageBudget, providerImageByteBudget } from "@oh-my-pi/snapcompact";
 
 const TOOL_RESULT_IMAGE_OMISSION: TextContent = {
 	type: "text",
 	text: "[image omitted: provider image limit]",
 };
 
-function countImages(context: Context): number {
-	let count = 0;
+function collectImageSizes(context: Context): number[] {
+	const sizes: number[] = [];
 	for (const message of context.messages) {
 		if (!Array.isArray(message.content)) continue;
 		for (const part of message.content) {
-			if (part.type === "image") count++;
+			if (part.type === "image") sizes.push(part.data.length);
 		}
 	}
-	return count;
+	return sizes;
+}
+
+/** Count of oldest images to drop so the surviving image payload fits `byteLimit`. */
+function imageDropCountForBytes(sizes: readonly number[], byteLimit: number): number {
+	let total = 0;
+	for (const size of sizes) total += size;
+	let drops = 0;
+	for (let index = 0; total > byteLimit && index < sizes.length; index++) {
+		total -= sizes[index] ?? 0;
+		drops++;
+	}
+	return drops;
 }
 
 function clampContent(
@@ -61,14 +73,20 @@ function clampToolResultMessage(message: ToolResultMessage, state: { remainingDr
 	return { ...message, content: content.length > 0 ? content : [TOOL_RESULT_IMAGE_OMISSION] };
 }
 
-/** Drops oldest transient image blocks so outgoing vision requests fit the active provider's image cap. */
+/** Drops oldest transient image blocks so outgoing vision requests fit the
+ *  active provider's image budget — both the per-request image COUNT cap and the
+ *  combined image-BYTE cap (a long snapcompact archive can stay under the count
+ *  cap yet bust the request-size limit on summed frame bytes). */
 export function clampProviderContextImages(context: Context, model: Model): Context {
 	if (!model.input.includes("image")) return context;
-	const limit = providerImageBudget(model.provider);
-	const totalImages = countImages(context);
-	if (totalImages <= limit) return context;
+	const sizes = collectImageSizes(context);
+	if (sizes.length === 0) return context;
+	const countDrops = Math.max(0, sizes.length - providerImageBudget(model.provider));
+	const byteDrops = imageDropCountForBytes(sizes, providerImageByteBudget(model.provider));
+	const drops = Math.max(countDrops, byteDrops);
+	if (drops <= 0) return context;
 
-	const state = { remainingDrops: totalImages - limit };
+	const state = { remainingDrops: drops };
 	const messages = context.messages.map(message => {
 		switch (message.role) {
 			case "user":

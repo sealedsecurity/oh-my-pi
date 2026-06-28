@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import type { Context, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { clampProviderContextImages } from "@oh-my-pi/pi-coding-agent/session/provider-image-budget";
+import { providerImageByteBudget } from "@oh-my-pi/snapcompact";
 
 const UMANS_MODEL = buildModel({
 	id: "umans-glm-5.2",
@@ -14,6 +15,19 @@ const UMANS_MODEL = buildModel({
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	contextWindow: 128000,
 	maxTokens: 4096,
+});
+
+const ANTHROPIC_MODEL = buildModel({
+	id: "claude-opus-4-8",
+	name: "claude-opus-4-8",
+	api: "anthropic-messages",
+	provider: "anthropic",
+	baseUrl: "https://api.anthropic.com",
+	reasoning: true,
+	input: ["text", "image"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 200000,
+	maxTokens: 8192,
 });
 
 function image(data: string): ImageContent {
@@ -105,5 +119,40 @@ describe("provider context image budgets", () => {
 		};
 
 		expect(clampProviderContextImages(context, UMANS_MODEL)).toBe(context);
+	});
+
+	it("drops oldest images when total image bytes exceed the provider byte budget", () => {
+		const byteBudget = providerImageByteBudget("anthropic");
+		const chunk = Math.ceil(byteBudget * 0.4);
+		const frame = (tag: string) => image(tag + "x".repeat(chunk - 1));
+		const context: Context = {
+			systemPrompt: [],
+			tools: [],
+			messages: [
+				{ role: "user", content: [frame("0")], timestamp: 0 },
+				{ role: "user", content: [frame("1")], timestamp: 1 },
+				{ role: "user", content: [frame("2")], timestamp: 2 },
+			],
+		};
+
+		const clamped = clampProviderContextImages(context, ANTHROPIC_MODEL);
+		const remaining = imageData(clamped);
+		const totalBytes = remaining.reduce((sum, data) => sum + data.length, 0);
+
+		// 3 frames sit far under Anthropic's image COUNT cap (90) yet total ~1.2x
+		// the byte budget; the oldest frame drops so the payload fits.
+		expect(totalBytes).toBeLessThanOrEqual(byteBudget);
+		expect(remaining.map(data => data[0])).toEqual(["1", "2"]);
+	});
+
+	it("keeps every image when total image bytes fit the provider byte budget", () => {
+		const small = image("x".repeat(1024));
+		const context: Context = {
+			systemPrompt: [],
+			tools: [],
+			messages: [{ role: "user", content: [small, small, small], timestamp: 0 }],
+		};
+
+		expect(clampProviderContextImages(context, ANTHROPIC_MODEL)).toBe(context);
 	});
 });
