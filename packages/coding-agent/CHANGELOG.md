@@ -197,6 +197,13 @@
 - Resolved status inconsistencies between `/extensions`, `/mcp list`, and the dashboard, ensuring MCP server states, allowlists/denylists, and configuration files (like `mcp.json`) stay fully synchronized.
 - Improved branch-mode task merges to preserve the agent's original commit history (messages and authors) and fixed a bug where merges were rejected due to unrelated dirty changes in the parent checkout.
 - Fixed an issue where the `Working...` loader spinner would prematurely disappear or fail to re-arm after a subagent (`task`) tool completed or during transient overlays (such as auto-compaction or auto-retry).
+### Added
+
+- Added `/mcp refresh` — re-fetch tools from already-connected MCP servers without tearing down connections. Recovers a session that connected while a server (e.g. an aggregating gateway mid-warmup) was still advertising an empty toolset.
+
+### Fixed
+
+- Fixed MCP tools vanishing for an entire session when discovery ran during a gateway's cold-start warmup. A successful-but-empty `tools/list` (a `200` with `{"tools":[]}`, common in the ~15-20s after an aggregating gateway restarts) was trusted as authoritative and cached for 30 days, so the session — and every later one reading the poisoned cache — came up with zero MCP tools. An empty toolset is no longer cached, an already-cached empty entry now reads as a miss, and a connected server that lists no tools is re-listed on a bounded backoff so the session self-heals once the server populates.
 
 ## [16.2.6] - 2026-06-29
 

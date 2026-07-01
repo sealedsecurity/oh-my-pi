@@ -246,6 +246,9 @@ export class MCPCommandController {
 			case "reload":
 				await this.#handleReload();
 				break;
+			case "refresh":
+				await this.#handleRefresh();
+				break;
 			default:
 				this.ctx.showError(`Unknown subcommand: ${subcommand}. Type /mcp help for usage.`);
 		}
@@ -277,6 +280,7 @@ export class MCPCommandController {
 			"  /mcp smithery-logout  Remove cached Smithery API key",
 			"  /mcp reconnect <name> Reconnect to a specific MCP server",
 			"  /mcp reload           Force reload and rediscover MCP runtime tools",
+			"  /mcp refresh          Re-fetch tools from connected servers (no reconnect)",
 			"  /mcp resources        List available resources from connected servers",
 			"  /mcp prompts          List available prompts from connected servers",
 			"  /mcp notifications    Show notification capabilities and subscription state",
@@ -1729,6 +1733,47 @@ export class MCPCommandController {
 			);
 		} catch (error) {
 			this.ctx.showError(`Failed to reload MCP: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	/**
+	 * Handle /mcp refresh — re-run `tools/list` on every already-connected
+	 * server and rebind the results, without tearing down connections.
+	 *
+	 * This is the recovery for a server that connected while its toolset was
+	 * still empty (e.g. an aggregating gateway answering `tools/list` with `[]`
+	 * during its cold-start warmup). Unlike `/mcp reload`, it keeps live sessions
+	 * and only refetches tools — the fast path when the connection is healthy but
+	 * came up toolless.
+	 */
+	async #handleRefresh(): Promise<void> {
+		if (!this.ctx.mcpManager) {
+			this.ctx.showError("MCP manager not available.");
+			return;
+		}
+		const connected = this.ctx.mcpManager.getConnectedServers();
+		if (connected.length === 0) {
+			this.#showMessage(
+				["", theme.fg("muted", "No connected MCP servers to refresh. Try /mcp reload."), ""].join("\n"),
+			);
+			return;
+		}
+		try {
+			this.#showMessage(["", theme.fg("muted", "Refreshing MCP tools from connected servers..."), ""].join("\n"));
+			await this.ctx.mcpManager.refreshAllTools();
+			await this.ctx.session.refreshMCPTools(this.ctx.mcpManager.getTools());
+			const toolCount = this.ctx.mcpManager.getTools().length;
+			this.#showMessage(
+				[
+					"",
+					theme.fg("success", `${theme.icon.loop} MCP tools refreshed`),
+					`  Connected servers: ${connected.length}`,
+					`  Tools available: ${toolCount}`,
+					"",
+				].join("\n"),
+			);
+		} catch (error) {
+			this.ctx.showError(`Failed to refresh MCP tools: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 
