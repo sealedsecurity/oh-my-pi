@@ -3174,6 +3174,30 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"bash.direnv": {
+		type: "enum",
+		values: ["auto", "off"] as const,
+		default: "auto",
+		ui: {
+			tab: "shell",
+			group: "Bash",
+			label: "direnv Auto-Load",
+			description:
+				"Auto-load (and auto-allow) a repo's direnv/devenv `.envrc` into the bash session so devenv tools and env vars are present without manual `direnv exec`",
+		},
+	},
+	"bash.direnvLoadTimeoutMs": {
+		type: "number",
+		default: 30_000,
+		ui: {
+			tab: "shell",
+			group: "Bash",
+			label: "direnv Load Timeout (ms)",
+			description:
+				"Max wait for the first `direnv export` (a cold devenv shell can be slow); on timeout the session runs without the direnv env",
+		},
+	},
+
 	// Shell output minimizer
 	"shellMinimizer.enabled": {
 		type: "boolean",

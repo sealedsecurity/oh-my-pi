@@ -10,6 +10,7 @@ import { Settings, type ShellMinimizerSettings } from "../config/settings";
 import { OutputSink } from "../session/streaming-output";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
+import { loadDirenvEnv } from "./direnv";
 import { buildNonInteractiveEnv } from "./non-interactive-env";
 
 export interface BashExecutorOptions {
@@ -214,7 +215,15 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	const minimizer = buildMinimizerOptions(settings.getGroup("shellMinimizer"));
 
 	const commandCwd = resolveShellCwd(options?.cwd);
-	const commandEnv = buildNonInteractiveEnv(options?.env);
+	// Load the repo's direnv/devenv env (cached per .envrc) so devenv tools land
+	// on PATH; the caller's explicit `env` still wins over direnv-provided values.
+	const direnvEnv =
+		settings.get("bash.direnv") === "off"
+			? null
+			: await loadDirenvEnv(commandCwd ?? process.cwd(), {
+					timeoutMs: settings.get("bash.direnvLoadTimeoutMs"),
+				});
+	const commandEnv = buildNonInteractiveEnv(direnvEnv ? { ...direnvEnv, ...options?.env } : options?.env);
 
 	// Apply command prefix if configured
 	const prefixedCommand = prefix ? `${prefix} ${command}` : command;
