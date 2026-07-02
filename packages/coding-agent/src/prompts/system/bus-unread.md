@@ -1,0 +1,1 @@
+[comms bus] Your bus inbox has new activity ({{count}} update{{#if multiple}}s{{/if}} since you last surfaced). Use the bus `inbox` tool to read your messages when convenient; this is a non-urgent notification, not an instruction.

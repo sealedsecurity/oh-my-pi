@@ -3791,6 +3791,30 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"bus.delivery": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			group: "Discovery & MCP",
+			label: "Comms-bus Delivery",
+			description:
+				"Open a local delivery socket so an external comms bus can push messages into this session (ping tier)",
+		},
+	},
+
+	"bus.inboxResourceUri": {
+		type: "string",
+		default: "",
+		ui: {
+			tab: "tools",
+			group: "Discovery & MCP",
+			label: "Comms-bus Inbox Resource",
+			description:
+				"MCP resource URI for this agent's bus inbox; when set, unread mail surfaces as an ambient reminder (message tier)",
+		},
+	},
+
 	// ────────────────────────────────────────────────────────────────────────
 	// Tasks
 	// ────────────────────────────────────────────────────────────────────────

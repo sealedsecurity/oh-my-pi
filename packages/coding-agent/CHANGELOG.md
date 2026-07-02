@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added cross-session comms-bus delivery: an external message bus can push into a running session over a per-process Unix socket (`$XDG_RUNTIME_DIR/omp/`), gated on the `bus.delivery` setting and authenticated by a per-agent capability token. Urgent messages reuse the in-session IRC steer path — mid-turn they fold in as a non-interrupting aside at the next step boundary, idle they wake a turn. Each reachable agent advertises `{socketPath, token}` on the registry for addressing.
+- Added an ambient "bus inbox" reminder: when `bus.inboxResourceUri` is set, new-mail resource updates surface as a compact non-urgent notification without the client hand-subscribing.
+
 ## [16.2.6] - 2026-06-29
 
 ### Changed

@@ -43,6 +43,12 @@ export interface AgentRef {
 	lastActivity: number;
 	/** Short gist of what the agent is currently doing (latest intent or tool), for the work-aware roster. Display-only. */
 	activity?: string;
+	/**
+	 * Comms-bus delivery endpoint (F2a), present only while this agent is
+	 * reachable via the process delivery socket. The external bus reads
+	 * `{ socketPath, token }` from the roster to POST a `ping` to this agent.
+	 */
+	endpoint?: { socketPath: string; token: string };
 }
 
 export type RegistryEvent =
@@ -131,6 +137,18 @@ export class AgentRegistry {
 		ref.lastActivity = Date.now();
 		if (ref.activity === gist) return;
 		ref.activity = gist;
+	}
+
+	/**
+	 * Set or clear an agent's comms-bus delivery endpoint (F2a). Emits
+	 * `status_changed` so roster consumers (and the bus MCP client watching the
+	 * registry) learn the agent's reachability. Pass `undefined` to withdraw it.
+	 */
+	setEndpoint(id: string, endpoint: AgentRef["endpoint"]): void {
+		const ref = this.#refs.get(id);
+		if (!ref) return;
+		ref.endpoint = endpoint;
+		this.#emit({ type: "status_changed", ref });
 	}
 
 	attachSession(id: string, session: AgentSession, sessionFile?: string | null): void {

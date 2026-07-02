@@ -92,6 +92,7 @@ import {
 import { MCP_CONNECTION_STATUS_EVENT_CHANNEL, type McpConnectionStatusEvent } from "./mcp/startup-events";
 import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memory-backend";
 import type { MnemopiSessionState } from "./mnemopi/state";
+import busUnreadTemplate from "./prompts/system/bus-unread.md" with { type: "text" };
 import asyncResultTemplate from "./prompts/tools/async-result.md" with { type: "text" };
 import lateDiagnosticTemplate from "./prompts/tools/lsp-late-diagnostic.md" with { type: "text" };
 import { AgentLifecycleManager } from "./registry/agent-lifecycle";
@@ -302,6 +303,25 @@ function buildMcpNotificationBatchMessage(entries: McpNotificationEntry[]): Agen
 	return {
 		role: "user",
 		content: [{ type: "text", text: lines.join("\n") }],
+		attribution: "agent",
+		timestamp: Date.now(),
+	};
+}
+
+type BusUnreadEntry = {
+	inboxUri: string;
+};
+
+function buildBusUnreadBatchMessage(entries: BusUnreadEntry[]): AgentMessage | null {
+	if (entries.length === 0) return null;
+	// Each entry is one inbox-changed notification since the last surface; the
+	// count is how many arrived, not a server-authoritative unread total (the
+	// resource-update carries no count). The agent reads the real inbox via the
+	// bus tool — this is only the ambient nudge to do so.
+	const count = entries.length;
+	return {
+		role: "user",
+		content: [{ type: "text", text: prompt.render(busUnreadTemplate, { count, multiple: count > 1 }) }],
 		attribution: "agent",
 		timestamp: Date.now(),
 	};
@@ -2761,6 +2781,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		session.yieldQueue.register<McpNotificationEntry>("mcp-notification", {
 			build: buildMcpNotificationBatchMessage,
 		});
+		session.yieldQueue.register<BusUnreadEntry>("bus-unread", {
+			build: buildBusUnreadBatchMessage,
+		});
 		session.yieldQueue.register<DeferredDiagnosticsEntry>(LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE, {
 			isStale: entry => entry.isStale(),
 			build: buildLateDiagnosticsBatchMessage,
@@ -2945,21 +2968,36 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			postmortem.register("mcp-notification-cleanup", clearDebounceTimers);
 			mcpManager.setOnResourcesChanged((serverName, uri) => {
 				logger.debug("MCP resources changed", { path: `mcp:${serverName}`, uri });
-				if (!settings.get("mcp.notifications")) return;
 				const debounceMs = settings.get("mcp.notificationDebounceMs");
 				const key = `${serverName}:${uri}`;
-				const existing = notificationDebounceTimers.get(key);
-				if (existing) clearTimeout(existing);
+				clearTimeout(notificationDebounceTimers.get(key));
+				// The comms-bus inbox resource routes to a dedicated unread reminder
+				// (F1), gated on `bus.inboxResourceUri` — independent of the generic
+				// `mcp.notifications` toggle so bus mail nudges work on their own.
+				const busInboxUri = (settings.get("bus.inboxResourceUri") ?? "").trim();
+				const isBusInbox = busInboxUri !== "" && uri === busInboxUri;
+				if (!isBusInbox && !settings.get("mcp.notifications")) return;
 				notificationDebounceTimers.set(
 					key,
 					setTimeout(() => {
 						notificationDebounceTimers.delete(key);
+						if (isBusInbox) {
+							session.yieldQueue.enqueue<BusUnreadEntry>("bus-unread", { inboxUri: uri });
+							return;
+						}
 						// Re-check: user may have disabled notifications during the debounce window
 						if (!settings.get("mcp.notifications")) return;
 						session.yieldQueue.enqueue<McpNotificationEntry>("mcp-notification", { serverName, uri });
 					}, debounceMs),
 				);
 			});
+			// F1 auto-subscribe: when a bus inbox resource is configured, turn on MCP
+			// resource notifications so the subscribe path covers it — the unread
+			// reminder then works without the client hand-subscribing or flipping
+			// `mcp.notifications`.
+			if ((settings.get("bus.inboxResourceUri") ?? "").trim() !== "") {
+				mcpManager.setNotificationsEnabled(true);
+			}
 		}
 
 		startDeferredMCPDiscovery?.(session, {

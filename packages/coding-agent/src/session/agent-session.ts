@@ -249,6 +249,7 @@ import sideChannelNoToolsReminder from "../prompts/system/side-channel-no-tools.
 import ttsrInterruptTemplate from "../prompts/system/ttsr-interrupt.md" with { type: "text" };
 import ttsrToolReminderTemplate from "../prompts/system/ttsr-tool-reminder.md" with { type: "text" };
 import unexpectedStopRetryTemplate from "../prompts/system/unexpected-stop-retry.md" with { type: "text" };
+import { AgentRegistry } from "../registry/agent-registry";
 import {
 	deobfuscateAssistantContent,
 	deobfuscateSessionContext,
@@ -307,6 +308,7 @@ import {
 	shouldPromptCodexAutoRedeem,
 } from "./codex-auto-reset";
 import { findCompactMode } from "./compact-modes";
+import { SessionDeliveryBroker } from "./delivery-broker";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -1439,6 +1441,9 @@ export class AgentSession {
 	// Agent identity (registry id) used for IRC routing and job ownership.
 	#agentId: string | undefined;
 	#agentKind: "main" | "sub" = "main";
+	// Per-agent capability token for the comms-bus delivery socket (F2a). Minted
+	// when the broker is started for this session; undefined when bus.delivery is off.
+	#deliveryToken: string | undefined;
 	#providerSessionId: string | undefined;
 	#freshProviderSessionId: string | undefined;
 	#isDisposed = false;
@@ -1910,6 +1915,7 @@ export class AgentSession {
 		this.#agentId = config.agentId;
 		this.#agentKind = config.agentKind ?? "main";
 		this.#providerSessionId = config.providerSessionId;
+		this.#maybeStartDeliveryBroker();
 		this.agent.setAssistantMessageEventInterceptor((message, assistantMessageEvent) => {
 			const event: AgentEvent = {
 				type: "message_update",
@@ -5023,6 +5029,7 @@ export class AgentSession {
 		this.yieldQueue.clear();
 		this.agent.setAsideMessageProvider(undefined);
 		this.#stopAdvisorRuntime();
+		this.#stopDeliveryBroker();
 		this.#evalExecutionDisposing = true;
 	}
 
@@ -12838,6 +12845,39 @@ export class AgentSession {
 	// =========================================================================
 	// IRC Delivery
 	// =========================================================================
+
+	/**
+	 * Start this session's comms-bus delivery endpoint (F2a) when `bus.delivery`
+	 * is enabled: mint a per-agent capability token, register it with the
+	 * process-global {@link SessionDeliveryBroker} (which opens the shared Unix
+	 * socket on first use), and advertise `{ socketPath, token }` on the registry
+	 * so the external bus can reach this agent. No-op without an agent id, for
+	 * advisor sessions, or when the setting is off. Best-effort: a broker failure
+	 * must never break session bring-up.
+	 */
+	#maybeStartDeliveryBroker(): void {
+		if (this.#agentId === undefined) return;
+		if (this.settings.get("bus.delivery") !== true) return;
+		try {
+			const token = crypto.randomUUID();
+			const socketPath = SessionDeliveryBroker.global().registerAgent(this.#agentId, token);
+			this.#deliveryToken = token;
+			AgentRegistry.global().setEndpoint(this.#agentId, { socketPath, token });
+		} catch (error) {
+			logger.warn("Failed to start comms-bus delivery endpoint", {
+				agentId: this.#agentId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	/** Withdraw this session's delivery endpoint. Idempotent; safe when never started. */
+	#stopDeliveryBroker(): void {
+		if (this.#agentId === undefined || this.#deliveryToken === undefined) return;
+		SessionDeliveryBroker.global().unregisterAgent(this.#agentId);
+		AgentRegistry.global().setEndpoint(this.#agentId, undefined);
+		this.#deliveryToken = undefined;
+	}
 
 	/**
 	 * Deliver an IRC message into this session (recipient side; called by the
