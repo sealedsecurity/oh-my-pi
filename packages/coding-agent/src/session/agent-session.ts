@@ -2123,6 +2123,15 @@ export class AgentSession {
 				this.#pendingRewindReport = undefined;
 				await this.#applyRewind(rewindReport, messages);
 			}
+			// A `compact` tool call this turn requests context compaction. Run it
+			// only at the genuine settle (`willContinue === false`) — never between
+			// tool-loop turns — because `compact()` aborts the active agent
+			// operation, which is a no-op once the run is ending but would truncate
+			// a still-continuing turn. Deferring here is the whole point of the
+			// tool signalling rather than compacting inline.
+			if (context?.willContinue === false) {
+				await this.#applyRequestedCompaction(messages);
+			}
 			if (context?.message.role === "assistant") {
 				const detection = this.#activeToolCallLoopGuard()?.recordTurn({
 					message: context.message,
@@ -11078,6 +11087,51 @@ export class AgentSession {
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 		this.#checkpointState = undefined;
 		this.#pendingRewindReport = undefined;
+	}
+
+	/**
+	 * Run the compaction requested by a `compact` tool call this turn. Invoked
+	 * from `onTurnEnd` at the genuine settle so `compact()`'s "abort current
+	 * operation first" step is a no-op (the run is already ending). Best-effort:
+	 * a compaction that is already running, or a session too small / already
+	 * compacted, is a benign no-op — the goal state already holds — so those are
+	 * swallowed; anything else is logged without escaping the settle path.
+	 */
+	async #applyRequestedCompaction(messages: AgentMessage[]): Promise<void> {
+		let instructions: string | undefined;
+		let found = false;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const message = messages[i];
+			if (message?.role !== "toolResult" || message.toolName !== "compact" || message.isError) continue;
+			const details = message.details;
+			if (
+				details &&
+				typeof details === "object" &&
+				"instructions" in details &&
+				typeof details.instructions === "string"
+			) {
+				instructions = details.instructions.trim() || undefined;
+			}
+			found = true;
+			break;
+		}
+		if (!found) return;
+		// Another compaction (manual, or an auto threshold/idle pass that claimed
+		// this settle) is already running — its rewrite sheds the context, so skip
+		// rather than race a second appendCompaction/replaceMessages. `isCompacting`
+		// covers both the manual (#compactionAbortController) and auto
+		// (#autoCompactionAbortController) controllers.
+		if (this.isCompacting) return;
+		try {
+			await this.compact(instructions);
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			if (/nothing to compact|already compacted|too small|already in progress/i.test(detail)) {
+				logger.debug("Requested compaction was a no-op", { detail });
+			} else {
+				logger.warn("Requested compaction failed", { detail });
+			}
+		}
 	}
 	#isPlanDecisionTool(name: string): boolean {
 		return PLAN_DECISION_TOOLS.has(name);
