@@ -85,10 +85,23 @@ export class MCPToolCache {
 
 		if (parsed.configHash !== currentHash) return null;
 
+		// An empty cached toolset is treated as a MISS. A gateway warming up (or
+		// any server mid-restart) can answer `tools/list` with a successful
+		// `[]`; caching that as authoritative for 30 days poisoned every later
+		// session. Returning null forces a live re-list instead — and self-heals
+		// any pre-fix poisoned entry on the next read.
+		if (parsed.tools.length === 0) return null;
+
 		return parsed.tools as MCPToolDefinition[];
 	}
 
 	async set(serverName: string, config: MCPServerConfig, tools: MCPToolDefinition[]): Promise<void> {
+		// Never persist an empty toolset: a successful-but-empty `tools/list`
+		// during a server's warmup window is transient, not authoritative. The
+		// 30-day TTL would otherwise brick this and every future session until
+		// the config hash changed (see the empty-guard in `get`).
+		if (tools.length === 0) return;
+
 		let configHash: string;
 		try {
 			configHash = await hashConfig(config);

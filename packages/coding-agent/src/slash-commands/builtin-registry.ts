@@ -1297,6 +1297,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			{ name: "smithery-logout", description: "Remove cached Smithery API key" },
 			{ name: "reconnect", description: "Reconnect to a specific MCP server", usage: "<name>" },
 			{ name: "reload", description: "Force reload MCP runtime tools" },
+			{ name: "refresh", description: "Re-fetch tools from connected MCP servers (no reconnect)" },
 			{ name: "resources", description: "List available resources from connected servers" },
 			{ name: "prompts", description: "List available prompts from connected servers" },
 			{ name: "notifications", description: "Show notification capabilities and subscriptions" },
