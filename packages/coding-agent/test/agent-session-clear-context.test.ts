@@ -2,17 +2,57 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import * as bashExecutor from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import { parseSessionEntries } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { Snowflake } from "@oh-my-pi/pi-utils";
+
+/** Flatten the text blocks of a resolved context so a single assertion can check content. */
+function contextMessageText(messages: AgentMessage[]): string {
+	const texts: string[] = [];
+	for (const message of messages) {
+		if (!("content" in message)) continue;
+		const content = message.content;
+		if (typeof content === "string") {
+			texts.push(content);
+		} else if (Array.isArray(content)) {
+			for (const block of content) {
+				if (block.type === "text") texts.push(block.text);
+			}
+		}
+	}
+	return texts.join("\n");
+}
+
+/** Append a user+assistant turn on the persisted branch (mirrors seedConversation). Returns the assistant entry id. */
+function appendTurn(active: AgentSession, userText: string, assistantText: string): string {
+	active.sessionManager.appendMessage({ role: "user", content: userText, timestamp: Date.now() });
+	return active.sessionManager.appendMessage({
+		role: "assistant",
+		content: [{ type: "text", text: assistantText }],
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "claude-sonnet-4-5",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	});
+}
 
 describe("AgentSession.clearSessionContext", () => {
 	let tempDir: string;
@@ -93,12 +133,16 @@ describe("AgentSession.clearSessionContext", () => {
 		expect(result).toEqual({ droppedCount: liveBefore });
 		expect(active.messages).toHaveLength(0);
 
-		// The session itself survives: persistent id, title, file path, and the
-		// on-disk transcript all remain — clearing context is not deleting history.
+		// The session itself survives: persistent id, title, file path all remain.
+		// The MODEL context is now empty (the /clear boundary starts emission after
+		// itself for the non-transcript rebuild too), but the full-history EXPORT
+		// transcript still walks the whole branch — clearing context is not
+		// deleting history.
 		expect(active.sessionManager.getSessionId()).toBe(persistentId);
 		expect(active.sessionName).toBe(title);
 		expect(active.sessionFile).toBe(file);
-		expect(active.sessionManager.buildSessionContext().messages).toHaveLength(transcriptBefore);
+		expect(active.sessionManager.buildSessionContext().messages).toHaveLength(0);
+		expect(active.sessionManager.buildSessionContext({ transcript: true }).messages).toHaveLength(transcriptBefore);
 		const transcriptRaw = fs.readFileSync(file!, "utf8");
 		expect(transcriptRaw).toContain("first task");
 		expect(transcriptRaw).toContain("did the first task");
@@ -136,6 +180,116 @@ describe("AgentSession.clearSessionContext", () => {
 
 		expect(result).toBeUndefined();
 		expect(active.messages).toHaveLength(liveBefore);
+	});
+
+	it("keeps the model context empty after a resume/rebuild across a /clear (fix #4)", async () => {
+		const active = await createSession();
+		seedConversation(active);
+		expect(active.messages.length).toBeGreaterThan(0);
+
+		await active.clearSessionContext();
+		expect(active.messages).toHaveLength(0);
+
+		// Resume / /shake / reload rebuild the model context from the persisted
+		// branch and swap it into the agent. Reverting fix #4 (re-gating the
+		// boundary branch on transcript+collapseCompactedHistory) makes the
+		// non-transcript buildSessionContext() replay the pre-clear turns, so this
+		// replaceMessages repopulates the LLM context the /clear reported empty.
+		active.agent.replaceMessages(active.sessionManager.buildSessionContext().messages);
+
+		expect(active.messages).toHaveLength(0);
+	});
+
+	it("rebuilds the model context with only post-clear turns, not pre-clear history (fix #4)", async () => {
+		const active = await createSession();
+		seedConversation(active);
+		await active.clearSessionContext();
+
+		// A genuine turn recorded after the boundary.
+		appendTurn(active, "post-clear task", "did the post-clear task");
+
+		const rebuilt = active.sessionManager.buildSessionContext().messages;
+		const text = contextMessageText(rebuilt);
+
+		// The boundary starts emission after itself: only the post-clear pair is in
+		// the model context. Reverting fix #4 walks the full branch, so the
+		// pre-clear turns return and the length/exclusion assertions redden.
+		expect(rebuilt).toHaveLength(2);
+		expect(text).toContain("post-clear task");
+		expect(text).toContain("did the post-clear task");
+		expect(text).not.toContain("first task");
+		expect(text).not.toContain("did the first task");
+	});
+
+	it("elides a compaction preceding the /clear boundary from the rebuilt model context (fix #4)", async () => {
+		const active = await createSession();
+		// Pre-compaction turn; its assistant entry anchors the compaction's kept tail.
+		const keptId = appendTurn(active, "old task", "old answer");
+		active.sessionManager.appendCompaction("summary of old work", "old", keptId, 1000);
+		// Post-compaction, pre-clear turn.
+		appendTurn(active, "mid task", "mid answer");
+
+		await active.clearSessionContext();
+
+		// Post-clear turn — everything before the boundary (including the
+		// compaction summary + its kept tail) must be superseded by the boundary.
+		appendTurn(active, "new task", "new answer");
+
+		const rebuilt = active.sessionManager.buildSessionContext().messages;
+		const text = contextMessageText(rebuilt);
+
+		// Boundary is after the latest compaction, so it wins: only the post-clear
+		// pair emits. Reverting fix #4 falls through to the compaction branch,
+		// re-injecting the summary + kept tail + mid turn into the LLM context.
+		expect(rebuilt).toHaveLength(2);
+		expect(text).toContain("new task");
+		expect(text).toContain("new answer");
+		expect(text).not.toContain("summary of old work");
+		expect(text).not.toContain("old answer");
+		expect(text).not.toContain("mid answer");
+	});
+
+	it("refuses to clear while a foreground bash command is in flight (fix #3)", async () => {
+		const active = await createSession();
+		seedConversation(active);
+		const liveBefore = active.messages.length;
+		expect(liveBefore).toBeGreaterThan(0);
+		expect(active.sessionManager.getBranch().filter(entry => entry.type === "clear_boundary")).toHaveLength(0);
+
+		// Real in-flight seam: hang executeBash so its AbortController stays in the
+		// set and isBashRunning is genuinely true (Bun's spyOn cannot stub the
+		// getter). Release it after the assertions so the session tears down clean.
+		const dispatched = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<bashExecutor.BashResult>();
+		vi.spyOn(bashExecutor, "executeBash").mockImplementation(async () => {
+			dispatched.resolve();
+			return release.promise;
+		});
+
+		const inFlight = active.executeBash("sleep 999");
+		await dispatched.promise;
+		expect(active.isBashRunning).toBe(true);
+
+		const result = await active.clearSessionContext();
+
+		// No-op: undefined, messages intact, and no clear_boundary appended.
+		// Reverting fix #3 (guard back to isStreaming only) lets /clear proceed —
+		// result becomes { droppedCount }, messages drop to 0, and a boundary lands.
+		expect(result).toBeUndefined();
+		expect(active.messages).toHaveLength(liveBefore);
+		expect(active.sessionManager.getBranch().filter(entry => entry.type === "clear_boundary")).toHaveLength(0);
+
+		release.resolve({
+			output: "",
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+			totalLines: 0,
+			totalBytes: 0,
+			outputLines: 0,
+			outputBytes: 0,
+		});
+		await inFlight;
 	});
 });
 

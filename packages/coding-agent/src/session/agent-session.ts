@@ -5868,7 +5868,13 @@ export class AgentSession {
 	 * Returns `undefined` without mutating anything while a response is streaming.
 	 */
 	async clearSessionContext(): Promise<ClearSessionContextResult | undefined> {
-		if (this.isStreaming) return undefined;
+		// Refuse while a response streams OR a foreground user bash/python
+		// execution is in flight: those complete via recordBashResult()/
+		// recordPythonResult(), which append directly to agent.state when not
+		// streaming, so a command finishing after the reset would land its output
+		// after the clear boundary and re-enter the supposedly empty context. The
+		// sibling boundary op (branchFromBtw) guards on the same predicates.
+		if (this.isStreaming || this.isBashRunning || this.isEvalRunning) return undefined;
 		const droppedCount = this.agent.state.messages.length;
 
 		// Tear down the same per-turn runtime state that newSession() resets across
@@ -5890,6 +5896,12 @@ export class AgentSession {
 		this.agent.reset();
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
+		// Reset the session_stop continuation chain: clearing dropped any queued
+		// continuation message above, but the counters would otherwise carry over,
+		// so the next post-clear turn is reported to hooks as part of the old
+		// chain and can hit SESSION_STOP_CONTINUATION_CAP early (mirrors abort()/
+		// newSession()).
+		this.#resetSessionStopContinuationState();
 
 		// Drop checkpoint/rewind runtime state alongside the messages that carried
 		// it: the checkpoint tool result is gone from agent.state, so an intact

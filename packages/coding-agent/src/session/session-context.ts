@@ -355,20 +355,22 @@ export function buildSessionContext(
 			}
 		}
 	} else if (
-		options?.transcript &&
-		options.collapseCompactedHistory &&
 		clearBoundaryIdx >= 0 &&
 		clearBoundaryIdx > (compaction ? path.findIndex(e => e.type === "compaction" && e.id === compaction.id) : -1)
 	) {
-		// Live surface only: a `/clear` boundary durably hides everything before
-		// it from the collapsed transcript, so a rebuild (theme change, focus
-		// attach, /shake, resume) does not resurrect the pre-clear conversation
-		// the model context already dropped. The full history stays on disk and
-		// the plain `transcript:true` export/resume branch above walks it
-		// unchanged. When a compaction and a clear boundary interact, the later
-		// one on the path wins: a boundary after the latest compaction elides
-		// that compaction (and its kept tail) too, so only genuinely post-clear
-		// entries render.
+		// A `/clear` boundary durably starts emission after it — for BOTH the
+		// collapsed live transcript AND the model context (non-transcript) rebuild
+		// that feeds agent.replaceMessages (resume, /shake, reload, image drop).
+		// Without honoring it here, those model-context rebuilds walk the full
+		// persisted branch and put the pre-clear turns back into the LLM context
+		// even though `/clear` reported it empty. The full-history export/resume
+		// path (`transcript && !collapseCompactedHistory`) is handled by the first
+		// branch above and left untouched, so on-disk history stays recoverable.
+		// When a compaction and a clear boundary interact, the later one on the
+		// path wins: a boundary after the latest compaction elides that compaction
+		// (and its kept tail) too, so only genuinely post-clear entries emit; a
+		// boundary before the latest compaction is superseded by it (the
+		// `else if (compaction)` branch below handles that case via this guard).
 		for (let i = clearBoundaryIdx + 1; i < path.length; i++) {
 			appendMessage(path[i]);
 		}
