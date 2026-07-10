@@ -117,4 +117,44 @@ describe("atomicWriteThroughSymlink", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
+
+	test("resolves a dangling symlink chain to its final referent, preserving every link", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-atomic-write-"));
+		try {
+			// link -> mid -> config.yml, where the FINAL referent does not exist yet
+			// (first-run dotfiles: a chain of links terminating at a not-yet-created
+			// file). realpath throws ENOENT at the tail, so the resolver must walk
+			// every hop rather than clobbering the first intermediate link.
+			const referent = path.join(dir, "config.yml");
+			const mid = path.join(dir, "mid.yml");
+			const link = path.join(dir, "linked.yml");
+			await fs.symlink(referent, mid);
+			await fs.symlink(mid, link);
+
+			await atomicWriteThroughSymlink(link, "fresh\n");
+
+			expect((await fs.lstat(link)).isSymbolicLink()).toBe(true);
+			expect((await fs.lstat(mid)).isSymbolicLink()).toBe(true);
+			expect(await fs.readFile(referent, "utf8")).toBe("fresh\n");
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("creates a brand-new file with 0600, never a world-readable default", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-atomic-write-"));
+		const originalUmask = process.umask(0o022);
+		try {
+			// No existing target: a fresh config that may hold secrets must not be
+			// born 0644. The temp is created at 0600 from the start, so the rename
+			// never exposes contents even briefly under a permissive umask.
+			const p = path.join(dir, "config.yml");
+			await atomicWriteThroughSymlink(p, "secret: fresh\n");
+			expect(await fs.readFile(p, "utf8")).toBe("secret: fresh\n");
+			expect((await fs.stat(p)).mode & 0o777).toBe(0o600);
+		} finally {
+			process.umask(originalUmask);
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 });
