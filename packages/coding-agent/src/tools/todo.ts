@@ -396,9 +396,11 @@ function applyEntry(phases: TodoPhase[], entry: TodoOpEntryValue, errors: string
 			}
 			const reason = entry.reason?.trim() || undefined;
 			for (const task of getTaskTargets(phases, entry, errors)) {
-				// Only actionable open work can be blocked: blocking a phase must
-				// not reopen completed/abandoned tasks or erase finished progress.
-				if (task.status !== "pending" && task.status !== "in_progress") continue;
+				// Only actionable open work can be blocked: blocking a phase must not
+				// reopen completed/abandoned tasks or erase finished progress. An
+				// already-blocked task stays eligible so a later block can refine its
+				// blocker note (e.g. first blocked without a reason, then with one).
+				if (task.status !== "pending" && task.status !== "in_progress" && task.status !== "blocked") continue;
 				task.status = "blocked";
 				task.blocker = reason;
 			}
@@ -472,7 +474,12 @@ export function phasesToMarkdown(phases: TodoPhase[]): string {
 		if (i > 0) out.push("");
 		out.push(`# ${phases[i].name}`);
 		for (const task of phases[i].tasks) {
-			out.push(`- [${STATUS_TO_MARKER[task.status]}] ${task.content}`);
+			// A blocked task's reason rides in a trailing HTML comment: invisible in
+			// rendered markdown, unambiguous to parse back (task content can't
+			// contain the comment delimiters), so the note survives `/todo edit` and
+			// export/import round-trips.
+			const blockerNote = task.status === "blocked" && task.blocker ? ` <!-- blocker: ${task.blocker} -->` : "";
+			out.push(`- [${STATUS_TO_MARKER[task.status]}] ${task.content}${blockerNote}`);
 		}
 	}
 	return `${out.join("\n")}\n`;
@@ -522,7 +529,15 @@ export function markdownToPhases(md: string): { phases: TodoPhase[]; errors: str
 				errors.push(`Line ${lineNum + 1}: unknown status marker "[${marker}]" (use [ ], [x], [/], [-], [!])`);
 				continue;
 			}
-			currentPhase.tasks.push({ content: taskMatch[2].trim(), status });
+			// Recover a blocked task's reason from its trailing HTML comment (see
+			// phasesToMarkdown), then strip the comment from the visible content.
+			const rawContent = taskMatch[2].trim();
+			const blockerMatch = /^(.*?)\s*<!--\s*blocker:\s*(.*?)\s*-->$/.exec(rawContent);
+			if (status === "blocked" && blockerMatch) {
+				currentPhase.tasks.push({ content: blockerMatch[1].trim(), status, blocker: blockerMatch[2].trim() });
+			} else {
+				currentPhase.tasks.push({ content: rawContent, status });
+			}
 			continue;
 		}
 

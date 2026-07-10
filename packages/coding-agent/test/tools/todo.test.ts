@@ -243,6 +243,21 @@ describe("TodoTool operations", () => {
 		expect(byContent("a")?.blocker).toBeUndefined();
 	});
 
+	it("re-blocking an already-blocked task refines its blocker note", async () => {
+		const tool = new TodoTool(createSession());
+		await tool.execute("call-1", { op: "init", list: [{ phase: "Work", items: ["a", "b"] }] });
+		// First block with no reason, then block again to add one — the agent often
+		// learns what it's waiting on only after the initial block.
+		await tool.execute("call-2", { op: "block", task: "b" });
+		const first = await tool.execute("call-3", { op: "block", task: "b" });
+		expect(first.details?.phases[0]?.tasks.find(task => task.content === "b")?.blocker).toBeUndefined();
+
+		const refined = await tool.execute("call-4", { op: "block", task: "b", reason: "waiting on user" });
+		const bTask = refined.details?.phases[0]?.tasks.find(task => task.content === "b");
+		expect(bTask?.status).toBe("blocked");
+		expect(bTask?.blocker).toBe("waiting on user");
+	});
+
 	it("rejects a block with neither task nor phase target", async () => {
 		const tool = new TodoTool(createSession());
 		await tool.execute("call-1", { op: "init", list: [{ phase: "Work", items: ["a", "b"] }] });
@@ -286,7 +301,10 @@ describe("TodoTool operations", () => {
 
 		const { phases: parsed, errors } = markdownToPhases(md);
 		expect(errors).toEqual([]);
-		expect(parsed[0]?.tasks.find(task => task.content === "a")?.status).toBe("blocked");
+		const parsedA = parsed[0]?.tasks.find(task => task.content === "a");
+		expect(parsedA?.status).toBe("blocked");
+		// The blocker reason must survive the round-trip, not just the status.
+		expect(parsedA?.blocker).toBe("x");
 	});
 
 	it("creates a phase when append targets a missing phase", async () => {

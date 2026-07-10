@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `block`/`unblock` todo operations and a `blocked` status for tasks waiting on external input; blocked tasks stay visible in the todo HUD and summary but are excluded from the incomplete-todo stop reminder, and an optional blocker note records what the task is waiting for.
+
 ## [16.3.4] - 2026-07-03
 
 ### Fixed
