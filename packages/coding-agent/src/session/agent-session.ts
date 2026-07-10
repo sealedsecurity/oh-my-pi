@@ -1792,6 +1792,14 @@ export class AgentSession {
 	#pendingRewindReport: string | undefined = undefined;
 	#lastCompletedRewind: CompletedRewindState | undefined = undefined;
 	#rewoundToolResultIds = new Set<string>();
+	/**
+	 * Tool-call ids of `compact` results already serviced by
+	 * {@link #applyRequestedCompaction}. compact() keeps recent tool results in
+	 * the retained window, so a compact toolResult survives into later turns'
+	 * `messages`; without this guard the settle scan re-discovers and re-runs it
+	 * on an unrelated later prompt. Mirrors {@link #rewoundToolResultIds}.
+	 */
+	#consumedCompactToolCallIds = new Set<string>();
 	#lastSuccessfulYieldToolCallId: string | undefined = undefined;
 	/**
 	 * Sticky across an in-flight prompt run: a successful `yield` makes the run
@@ -2070,6 +2078,15 @@ export class AgentSession {
 			if (rewindReport) {
 				this.#pendingRewindReport = undefined;
 				await this.#applyRewind(rewindReport, messages);
+			}
+			// A `compact` tool call this turn requests context compaction. Run it
+			// only at the genuine settle (`willContinue === false`) — never between
+			// tool-loop turns — because `compact()` aborts the active agent
+			// operation, which is a no-op once the run is ending but would truncate
+			// a still-continuing turn. Deferring here is the whole point of the
+			// tool signalling rather than compacting inline.
+			if (context?.willContinue === false) {
+				await this.#applyRequestedCompaction(messages);
 			}
 			if (context?.message.role === "assistant") {
 				const detection = this.#activeToolCallLoopGuard()?.recordTurn({
@@ -10776,6 +10793,68 @@ export class AgentSession {
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 		this.#checkpointState = undefined;
 		this.#pendingRewindReport = undefined;
+	}
+
+	/**
+	 * Run the compaction requested by a `compact` tool call this turn. Invoked
+	 * from `onTurnEnd` at the genuine settle so `compact()`'s "abort current
+	 * operation first" step is a no-op (the run is already ending). Best-effort:
+	 * a compaction that is already running, or a session too small / already
+	 * compacted, is a benign no-op — the goal state already holds — so those are
+	 * swallowed; anything else is logged without escaping the settle path.
+	 */
+	async #applyRequestedCompaction(messages: AgentMessage[]): Promise<void> {
+		let instructions: string | undefined;
+		let toolCallId: string | undefined;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const message = messages[i];
+			if (message?.role !== "toolResult" || message.toolName !== "compact" || message.isError) continue;
+			const details = message.details;
+			if (
+				details &&
+				typeof details === "object" &&
+				"instructions" in details &&
+				typeof details.instructions === "string"
+			) {
+				instructions = details.instructions.trim() || undefined;
+			}
+			toolCallId = message.toolCallId;
+			break;
+		}
+		// No compact result this turn, or the most recent one was already serviced
+		// on an earlier settle — compact() keeps recent tool results in the
+		// retained window, so a consumed request lingers in `messages` and the scan
+		// would otherwise re-discover and re-run it on a later prompt's settle.
+		if (toolCallId === undefined || this.#consumedCompactToolCallIds.has(toolCallId)) return;
+		// Another compaction (manual, or an auto threshold/idle pass that claimed
+		// this settle) is already running — its rewrite sheds the context, so skip
+		// rather than race a second appendCompaction/replaceMessages. Leave the id
+		// unconsumed so a later settle can still honor the request. `isCompacting`
+		// covers both the manual (#compactionAbortController) and auto
+		// (#autoCompactionAbortController) controllers.
+		if (this.isCompacting) return;
+		// Mark serviced before the attempt: whether the compaction runs, no-ops, or
+		// fails, the same result must never re-fire from the retained window later.
+		this.#consumedCompactToolCallIds.add(toolCallId);
+		try {
+			await this.compact(instructions);
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			if (/nothing to compact|already compacted|too small|already in progress/i.test(detail)) {
+				logger.debug("Requested compaction was a no-op", { detail });
+			} else {
+				logger.warn("Requested compaction failed", { detail });
+			}
+			return;
+		}
+		// compact() rewrote history into a NEW array; the caller's `messages` (fed
+		// to advisors' onTurnEnd next) still points at the pre-compaction snapshot.
+		// Re-sync in place so downstream sees post-compaction state, mirroring the
+		// mid-run splice in #maintainContextMidRun.
+		const compactedMessages = this.agent.state.messages;
+		if (compactedMessages !== messages) {
+			messages.splice(0, messages.length, ...compactedMessages);
+		}
 	}
 	#isPlanDecisionTool(name: string): boolean {
 		return PLAN_DECISION_TOOLS.has(name);
