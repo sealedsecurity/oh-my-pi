@@ -49,10 +49,20 @@ export function bucketRules(
 		if (disabled.has(rule.name)) continue;
 		if (!includeBuiltin && rule._source?.provider === BUILTIN_DEFAULTS_PROVIDER_ID) continue;
 
+		// A TTSR-conditioned rule is "consumed" by the manager and must not also
+		// appear in the rulebook/always buckets. `addRule` registers it on first
+		// sight but is name-idempotent — on a re-bucket (in-session refresh) it
+		// returns false for an already-registered rule, so gate on `hasRule`
+		// (membership) instead: a rule the manager holds is consumed whether this
+		// call or a prior reload registered it. A rule with conditions the manager
+		// rejected (unreachable scope, empty compile) is not held and correctly
+		// falls through to the buckets below, exactly as at init.
 		const hasTtsrCondition =
 			(rule.condition && rule.condition.length > 0) || (rule.astCondition && rule.astCondition.length > 0);
-		const isTtsrRule = hasTtsrCondition ? ttsrManager.addRule(rule) : false;
-		if (isTtsrRule) continue;
+		if (hasTtsrCondition) {
+			ttsrManager.addRule(rule);
+			if (ttsrManager.hasRule(rule.name)) continue;
+		}
 		if (rule.alwaysApply === true) {
 			alwaysApplyRules.push(rule);
 			continue;

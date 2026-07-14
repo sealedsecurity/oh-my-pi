@@ -566,6 +566,21 @@ function skillsEqual(a: readonly Skill[], b: readonly Skill[]): boolean {
 	return true;
 }
 
+/**
+ * Identity comparison of two rule snapshots by name+path, position by position.
+ * Same stable-order assumption as {@link skillsEqual}. Detects a rules-only
+ * change across a refresh so the advertised roster rebuilds even when no skill
+ * changed.
+ */
+function rulesEqual(a: readonly Rule[], b: readonly Rule[]): boolean {
+	if (a === b) return true;
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) {
+		if (a[i].name !== b[i].name || a[i].path !== b[i].path) return false;
+	}
+	return true;
+}
+
 const UNEXPECTED_STOP_MAX_RETRIES = 3;
 const UNEXPECTED_STOP_TIMEOUT_MS = 4000;
 const EMPTY_STOP_MAX_RETRIES = 3;
@@ -1283,8 +1298,13 @@ function createHandoffFileName(date = new Date()): string {
 // ACP Permission Gate
 // ============================================================================
 
-/** Tools that require user permission before execution when an ACP client is connected. */
-const PERMISSION_REQUIRED_TOOLS = new Set(["bash", "edit", "delete", "move"]);
+/**
+ * Tools that require user permission before execution when an ACP client is
+ * connected. `refresh` is included because refresh("mcp"/"all") reconnects MCP —
+ * spawning project `.mcp.json` stdio subprocesses (arbitrary exec) — so an ACP
+ * client must gate it like bash/edit rather than let a model self-invoke it.
+ */
+const PERMISSION_REQUIRED_TOOLS = new Set(["bash", "edit", "delete", "move", "refresh"]);
 
 /** Permission options presented to the client on each gated tool call. */
 const PERMISSION_OPTIONS: ClientBridgePermissionOption[] = [
@@ -1787,6 +1807,15 @@ export class AgentSession {
 
 	#skills: readonly Skill[];
 	#skillWarnings: SkillWarning[];
+	/**
+	 * The rendered rule roster (rulebook + always-apply) last advertised in the
+	 * system prompt, snapshot for change detection across a `refresh`. These
+	 * buckets are reload-stable (a TTSR-conditioned rule is consumed by the
+	 * manager, not re-bucketed — see `bucketRules`), so a name+path compare is a
+	 * sound roster-identity test. Starts empty: the constructor's prompt is
+	 * already current, and the first `refresh` aligns the snapshot to disk.
+	 */
+	#rosterRules: readonly Rule[] = [];
 
 	// Custom commands (TypeScript slash commands)
 	#customCommands: LoadedCustomCommand[] = [];
@@ -6898,7 +6927,17 @@ export class AgentSession {
 						disabledRules: ttsrSettings.disabledRules,
 					},
 				});
-				rosterChanged = this.applyReloadedSkills(reloaded.activeSkills);
+				const skillsChanged = this.applyReloadedSkills(reloaded.activeSkills);
+				// A rules-only change (edited rulebook / new always-apply rule with
+				// no skill change) must also rebuild the advertised prompt. Compare
+				// the rendered roster buckets — now reload-stable (bucketRules no
+				// longer mis-buckets already-registered TTSR rules) — against the
+				// last snapshot so the rebuild fires on a real rule change and
+				// stays a no-op otherwise (keeping prompt caching intact).
+				const nextRosterRules = [...reloaded.rulebookRules, ...reloaded.alwaysApplyRules];
+				const rulesChanged = !rulesEqual(this.#rosterRules, nextRosterRules);
+				this.#rosterRules = nextRosterRules;
+				rosterChanged = skillsChanged || rulesChanged;
 				this.#applyReloadedRoster?.({
 					skills: reloaded.activeSkills,
 					rulebookRules: reloaded.rulebookRules,

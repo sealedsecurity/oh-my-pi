@@ -48,7 +48,13 @@ export function summarizeRefresh(scope: RefreshScope, result: RefreshResult): st
 
 export class RefreshTool implements AgentTool<typeof refreshSchema, RefreshToolDetails> {
 	readonly name = "refresh";
-	readonly approval = "read" as const;
+	// `exec` tier: refresh("mcp"/"all") reconnects MCP, which spawns a project
+	// `.mcp.json` stdio server's `command` as a subprocess (arbitrary code
+	// execution) and re-reads project config mid-session. As a model-discoverable
+	// tool it must NOT auto-run in always-ask/write modes — a prompt-injected
+	// repo could otherwise self-invoke refresh("mcp") to run project config
+	// ungated. It also swaps the model and mutates sibling sessions' rosters.
+	readonly approval = "exec" as const;
 	readonly label = "Refresh";
 	readonly summary = "Re-read skills, rules, settings, and MCP from disk without restarting";
 	readonly description: string;
