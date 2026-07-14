@@ -35,9 +35,10 @@ describe("summarizeRefresh", () => {
 		);
 	});
 
-	it("renders an MCP reconnect only when mcp is true", () => {
+	it("renders an MCP reconnect only when mcp is set", () => {
 		expect(summarizeRefresh("mcp", { mcp: true })).toBe("Refreshed (mcp): MCP reconnected.");
-		expect(summarizeRefresh("mcp", { mcp: false })).toBe("Refreshed (mcp): nothing to reload.");
+		// `mcp` is `true | undefined` (never literal false); an untouched MCP surface omits the field.
+		expect(summarizeRefresh("mcp", {})).toBe("Refreshed (mcp): nothing to reload.");
 	});
 
 	it("renders every surface for an 'all' refresh", () => {

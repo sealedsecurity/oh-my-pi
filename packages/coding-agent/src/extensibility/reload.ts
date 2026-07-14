@@ -23,8 +23,14 @@ import { loadCapability } from "../discovery";
 import type { TtsrManager } from "../export/ttsr";
 import { loadSkills, type Skill, setActiveSkills } from "./skills";
 
-/** Config surface(s) an in-session refresh re-reads from disk. */
-export type RefreshScope = "skills" | "rules" | "settings" | "mcp" | "all";
+/**
+ * Config surface(s) an in-session refresh re-reads from disk. Single-sourced:
+ * the union type, the tool's arktype schema, and the slash-command validator
+ * all derive from this one tuple, so adding a scope can't leave a runtime guard
+ * silently stale.
+ */
+export const REFRESH_SCOPES = ["skills", "rules", "settings", "mcp", "all"] as const;
+export type RefreshScope = (typeof REFRESH_SCOPES)[number];
 
 /**
  * Outcome of an in-session refresh. Each field is populated only for the
@@ -39,8 +45,8 @@ export interface RefreshResult {
 	settingsChanged?: boolean;
 	/** Whether the active default model was swapped on a settings reload. */
 	modelSwapped?: boolean;
-	/** Whether MCP servers were rediscovered and their tools rebound. */
-	mcp?: boolean;
+	/** Whether MCP servers were rediscovered and their tools rebound. `true` when the reconnect ran; `undefined` when no MCP manager existed. */
+	mcp?: true;
 }
 
 /** Inputs for a roster reload, sourced from the live session/settings. */

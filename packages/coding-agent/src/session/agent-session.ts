@@ -550,11 +550,13 @@ export type AgentSessionEvent =
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 
-// RefreshScope / RefreshResult are defined in extensibility/reload.ts (a leaf
-// module) and re-exported here for consumers that import from the session.
-export type { RefreshResult, RefreshScope } from "../extensibility/reload";
-
-/** Order-insensitive-to-identity comparison of two skill snapshots by name+path. */
+/**
+ * Identity comparison of two skill snapshots by name+path, position by position.
+ * Discovery yields a stable order, so a positional compare is a correct
+ * roster-identity test; if that order ever varies this must move to a
+ * set-compare (a false "changed" would break the byte-identical prompt-cache
+ * claim the rebuild guard protects).
+ */
 function skillsEqual(a: readonly Skill[], b: readonly Skill[]): boolean {
 	if (a === b) return true;
 	if (a.length !== b.length) return false;
@@ -6917,7 +6919,16 @@ export class AgentSession {
 			const mcpManager = MCPManager.instance();
 			if (mcpManager) {
 				await mcpManager.disconnectAll();
-				await mcpManager.discoverAndConnect();
+				// Thread the same discovery options startup uses (sdk.ts). Without
+				// them, discoverAndConnect defaults re-enable project-level MCP
+				// servers a user opted out of via `mcp.enableProjectConfig: false`
+				// and reconnect browser servers startup deliberately filtered —
+				// a refresh must not silently bypass those controls.
+				await mcpManager.discoverAndConnect({
+					enableProjectConfig: this.settings.get("mcp.enableProjectConfig") ?? true,
+					filterExa: true,
+					filterBrowser: this.settings.get("browser.enabled") ?? false,
+				});
 				await this.refreshMCPTools(mcpManager.getTools());
 				result.mcp = true;
 			}
@@ -6947,8 +6958,9 @@ export class AgentSession {
 		const changed = !skillsEqual(this.#skills, skills);
 		this.#skills = skills;
 		// Fan out to running subagents. Every alive AgentSession (this one plus
-		// each sub) reads its own frozen snapshot, so update them all. Advisor
-		// refs are observability-only and excluded by `listVisibleTo`.
+		// each sub) reads its own frozen snapshot, so update them all. `list()`
+		// returns every registered session including advisors; advisors never
+		// resolve `skill://`, so overwriting their snapshot is a harmless no-op.
 		for (const ref of AgentRegistry.global().list()) {
 			if (ref.session && ref.session !== this) {
 				ref.session.#skills = skills;

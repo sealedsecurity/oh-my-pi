@@ -16,14 +16,14 @@
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { prompt } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
-import type { RefreshResult, RefreshScope } from "../extensibility/reload";
+import { REFRESH_SCOPES, type RefreshResult, type RefreshScope } from "../extensibility/reload";
 import refreshDescription from "../prompts/tools/refresh.md" with { type: "text" };
 import type { ToolSession } from "./index";
 
 const refreshSchema = type({
-	"scope?": type("'skills' | 'rules' | 'settings' | 'mcp' | 'all'").describe(
-		"which frozen config surface to re-read from disk (default: all)",
-	),
+	"scope?": type
+		.enumerated(...REFRESH_SCOPES)
+		.describe("which frozen config surface to re-read from disk (default: all)"),
 });
 
 /** Details payload for TUI rendering of a refresh result. */
@@ -55,6 +55,10 @@ export class RefreshTool implements AgentTool<typeof refreshSchema, RefreshToolD
 	readonly parameters = refreshSchema;
 	readonly strict = true;
 	readonly loadMode = "discoverable" as const;
+	// refresh() mutates process-global roster/rule snapshots, reconnects MCP, and
+	// can swap the model — it must not interleave with sibling tool calls in the
+	// same batch reading that shared state.
+	readonly concurrency = "exclusive" as const;
 
 	constructor(private readonly session: ToolSession) {
 		this.description = prompt.render(refreshDescription);

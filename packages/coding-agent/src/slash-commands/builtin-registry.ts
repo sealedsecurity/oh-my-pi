@@ -23,7 +23,7 @@ import {
 	getPluginsCacheDir,
 	MarketplaceManager,
 } from "../extensibility/plugins/marketplace";
-import type { RefreshScope } from "../extensibility/reload";
+import { REFRESH_SCOPES, type RefreshScope } from "../extensibility/reload";
 import { resolveMemoryBackend } from "../memory-backend";
 import { runPauseScreen } from "../modes/components/pause-screen";
 import { describeLoopLimitRuntime } from "../modes/loop-limit";
@@ -1459,7 +1459,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		allowArgs: true,
 		handle: async (command, runtime) => {
 			const arg = command.args.trim();
-			const validScopes: readonly RefreshScope[] = ["skills", "rules", "settings", "mcp", "all"];
+			const validScopes: readonly RefreshScope[] = REFRESH_SCOPES;
 			const scope: RefreshScope = arg === "" ? "all" : (arg as RefreshScope);
 			if (!validScopes.includes(scope)) {
 				return usage(`Unknown refresh scope "${arg}". Use: ${validScopes.join(", ")}.`, runtime);
