@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 
 // Settings.reload() is the in-session settings re-read. Its load-bearing
 // contract is the "/model reformat footgun": it MUST pick up an on-disk edit
@@ -54,10 +54,7 @@ describe("Settings.reload() footgun-safe re-read", () => {
 
 		// Edit the file the way an operator (or nix sync) would: swap the default
 		// model, keeping the surrounding comments/whitespace untouched.
-		const edited = HAND_AUTHORED_CONFIG.replace(
-			"anthropic/claude-sonnet-4-5",
-			"anthropic/claude-sonnet-4-6",
-		);
+		const edited = HAND_AUTHORED_CONFIG.replace("anthropic/claude-sonnet-4-5", "anthropic/claude-sonnet-4-6");
 		fs.writeFileSync(configPath, edited);
 
 		const { changed } = await settings.reload();

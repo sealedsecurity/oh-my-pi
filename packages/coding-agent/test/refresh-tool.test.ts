@@ -1,11 +1,9 @@
 import { describe, expect, it, vi } from "bun:test";
 import type { RefreshResult, RefreshScope } from "@oh-my-pi/pi-coding-agent/extensibility/reload";
-import {
-	executeAcpBuiltinSlashCommand,
-	type SlashCommandRuntime,
-} from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
-import { RefreshTool, summarizeRefresh } from "@oh-my-pi/pi-coding-agent/tools/refresh";
+import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
+import type { SlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { RefreshTool, summarizeRefresh } from "@oh-my-pi/pi-coding-agent/tools/refresh";
 
 // summarizeRefresh renders a live refresh into the one-line operator summary.
 // It is the sole surface the `/refresh` command and the RefreshTool print, so
@@ -18,9 +16,7 @@ describe("summarizeRefresh", () => {
 	});
 
 	it("renders a changed settings reload as 'settings updated'", () => {
-		expect(summarizeRefresh("settings", { settingsChanged: true })).toBe(
-			"Refreshed (settings): settings updated.",
-		);
+		expect(summarizeRefresh("settings", { settingsChanged: true })).toBe("Refreshed (settings): settings updated.");
 	});
 
 	it("renders a no-op settings reload as 'settings unchanged'", () => {

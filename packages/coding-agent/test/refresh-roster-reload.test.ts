@@ -5,10 +5,7 @@ import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { reset as resetCapabilities } from "@oh-my-pi/pi-coding-agent/capability";
-import {
-	getActiveRules,
-	resetActiveRulesForTests,
-} from "@oh-my-pi/pi-coding-agent/capability/rule";
+import { getActiveRules, resetActiveRulesForTests } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 // Register the discovery providers (skills/rules) as a side effect.
 import "@oh-my-pi/pi-coding-agent/discovery";
