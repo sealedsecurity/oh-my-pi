@@ -786,6 +786,26 @@ it("read tool: requestPermission is never called for non-gated tools", async () 
 	expect(readTool.executeCalls).toBe(1);
 });
 
+// refresh("mcp"/"all") reconnects MCP — spawning project `.mcp.json` stdio
+// subprocesses (arbitrary exec) — so an ACP client must gate it like bash/edit
+// rather than let a model self-invoke it. It is in PERMISSION_REQUIRED_TOOLS.
+// Pre-fix: refresh was absent from the set, so it ran ungated.
+it("refresh tool requests ACP permission before executing", async () => {
+	const refreshTool = makeFakeTool("refresh");
+	const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([refreshTool], bridge);
+
+	await session.setActiveToolsByName(["refresh"]);
+	const wrappedRefresh = session.agent.state.tools.find(t => t.name === "refresh");
+	expect(wrappedRefresh).toBeDefined();
+
+	await wrappedRefresh!.execute("call-refresh", {}, undefined, undefined as never, undefined as never);
+
+	expect(permissionSpy).toHaveBeenCalledTimes(1);
+	expect(refreshTool.executeCalls).toBe(1);
+});
+
 it("setActiveToolsByName normalizes legacy tool names", async () => {
 	const grepTool = makeFakeTool("grep");
 	const globTool = makeFakeTool("glob");

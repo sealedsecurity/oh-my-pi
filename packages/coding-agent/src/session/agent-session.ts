@@ -1417,6 +1417,10 @@ function getPermissionIntent(
 			cacheKey: "edit:move",
 		};
 	}
+	if (toolName === "refresh") {
+		const scope = getStringProperty(a, "scope") ?? "all";
+		return { toolName, title: `Refresh ${scope}`, cacheKey: "refresh" };
+	}
 	return undefined;
 }
 

@@ -3,6 +3,7 @@ import type { RefreshResult, RefreshScope } from "@oh-my-pi/pi-coding-agent/exte
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
 import type { SlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { requiresApproval } from "@oh-my-pi/pi-coding-agent/tools/approval";
 import { RefreshTool, summarizeRefresh } from "@oh-my-pi/pi-coding-agent/tools/refresh";
 
 // summarizeRefresh renders a live refresh into the one-line operator summary.
@@ -106,6 +107,29 @@ describe("RefreshTool.execute", () => {
 		expect(out.isError).toBe(true);
 		expect(out.content).toEqual([{ type: "text", text: "Refresh is unavailable in this session." }]);
 		expect(out.details).toEqual({ scope: "all", result: {} });
+	});
+});
+
+// Security: refresh("mcp"/"all") reconnects MCP, spawning a project `.mcp.json`
+// stdio server's command as a subprocess (arbitrary exec). As a
+// model-discoverable tool it must be tiered "exec" so it does NOT auto-run in
+// always-ask/write approval modes — a prompt-injected repo could otherwise
+// self-invoke refresh("mcp") to run project config ungated. Pre-fix: "read".
+describe("RefreshTool approval tier", () => {
+	it("is tiered 'exec' so it never auto-runs in always-ask/write modes", () => {
+		const tool = new RefreshTool(toolSession(vi.fn(async (_scope: RefreshScope) => ({}) as RefreshResult)));
+		expect(tool.approval).toBe("exec");
+	});
+
+	// The tier is only load-bearing through the approval gate: bind the real tool
+	// to requiresApproval and assert the observable outcome. In always-ask and
+	// write modes the exec tier forces a prompt (no auto-run); yolo still allows.
+	// Pre-fix (read tier) always-ask/write would auto-allow → required:false.
+	it("forces an approval prompt in always-ask and write modes, auto-allows only in yolo", () => {
+		const tool = new RefreshTool(toolSession(vi.fn(async (_scope: RefreshScope) => ({}) as RefreshResult)));
+		expect(requiresApproval(tool, { scope: "mcp" }, "always-ask").required).toBe(true);
+		expect(requiresApproval(tool, { scope: "mcp" }, "write").required).toBe(true);
+		expect(requiresApproval(tool, { scope: "mcp" }, "yolo").required).toBe(false);
 	});
 });
 
