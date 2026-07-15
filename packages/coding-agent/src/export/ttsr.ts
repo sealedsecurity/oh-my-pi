@@ -571,6 +571,16 @@ export class TtsrManager {
 		return this.#rules.size > 0;
 	}
 
+	/**
+	 * Whether a rule with this name is currently registered for TTSR monitoring.
+	 * Distinct from `addRule`'s return (which is `true` only on the call that
+	 * first registers a rule): a rule already registered on a prior reload is
+	 * still held here, so bucketing can tell "consumed by TTSR" from "rejected".
+	 */
+	hasRule(name: string): boolean {
+		return this.#rules.has(name);
+	}
+
 	/** All rules currently registered for TTSR monitoring, in registration order. */
 	getRules(): Rule[] {
 		return Array.from(this.#rules.values(), entry => entry.rule);

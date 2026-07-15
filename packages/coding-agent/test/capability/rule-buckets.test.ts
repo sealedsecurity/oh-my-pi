@@ -23,6 +23,18 @@ function makeRule(partial: Partial<Rule>): Rule {
 	};
 }
 
+// A TtsrManager with TTSR disabled — every addRule is rejected. Full TtsrSettings
+// so it type-checks; mirrors the inline object the disabled-manager test uses.
+function disabledManager(): TtsrManager {
+	return new TtsrManager({
+		enabled: false,
+		contextMode: "discard",
+		interruptMode: "always",
+		repeatMode: "once",
+		repeatGap: 10,
+	});
+}
+
 describe("bucketRules", () => {
 	it("registers a condition rule as TTSR and excludes it from rulebook/always buckets", () => {
 		const mgr = new TtsrManager();
@@ -127,5 +139,90 @@ describe("bucketRules", () => {
 		expect(mgr.checkDelta("contains FORBIDDEN token", { source: "text" })).toEqual([]);
 		expect(alwaysApplyRules.map(r => r.name)).toEqual([]);
 		expect(rulebookRules.map(r => r.name)).toEqual(["no-foo"]);
+	});
+
+	// In-session refresh re-runs bucketRules against the SAME live manager. A
+	// TTSR-conditioned rule the manager already holds must stay consumed on the
+	// re-bucket — pre-fix it gated on addRule()'s name-idempotent return (false
+	// the second time), so the already-registered rule fell through into the
+	// rulebook and the advertised roster grew on every refresh.
+	it("keeps a TTSR-conditioned rule consumed across a re-bucket with the same live manager", () => {
+		const mgr = new TtsrManager();
+		const ttsr = makeRule({ name: "no-foo", condition: ["FORBIDDEN"], description: "blocks foo" });
+
+		const first = bucketRules([ttsr], mgr);
+		expect(first.rulebookRules).toHaveLength(0);
+		expect(first.alwaysApplyRules).toHaveLength(0);
+
+		// Same manager, second pass — the rule is already registered, so addRule
+		// returns false; membership (hasRule) is what must keep it consumed.
+		const second = bucketRules([ttsr], mgr);
+		expect(second.rulebookRules).toHaveLength(0);
+		expect(second.alwaysApplyRules).toHaveLength(0);
+		expect(mgr.getRules().map(r => r.name)).toEqual(["no-foo"]);
+	});
+
+	// The fix must not OVER-consume: a rule with a TTSR condition the manager
+	// REJECTS (here TTSR disabled) is not held, so it must still fall through to
+	// the rulebook on both a first and a repeat bucketing — matching init.
+	it("falls a manager-rejected TTSR rule through to the rulebook on every bucketing", () => {
+		const mgr = disabledManager();
+		const ttsr = makeRule({ name: "no-foo", condition: ["FORBIDDEN"], description: "blocks foo" });
+
+		const first = bucketRules([ttsr], mgr);
+		expect(mgr.hasRule("no-foo")).toBe(false);
+		expect(first.rulebookRules.map(r => r.name)).toEqual(["no-foo"]);
+
+		const second = bucketRules([ttsr], mgr);
+		expect(mgr.hasRule("no-foo")).toBe(false);
+		expect(second.rulebookRules.map(r => r.name)).toEqual(["no-foo"]);
+	});
+
+	// Observable roster stability: the rendered bucket count (rulebook + always)
+	// must be identical across two identical re-buckets. Pre-fix it grew as
+	// already-registered TTSR rules leaked into the rulebook.
+	it("keeps the rendered bucket count stable across two identical re-buckets", () => {
+		const mgr = new TtsrManager();
+		const rules = [
+			makeRule({ name: "ttsr-a", condition: ["ALPHA"], description: "a" }),
+			makeRule({ name: "ttsr-b", astCondition: ["console.log($A)"], description: "b" }),
+			makeRule({ name: "book-a", description: "rulebook a" }),
+			makeRule({ name: "sticky-a", alwaysApply: true, description: "always a" }),
+		];
+
+		const first = bucketRules(rules, mgr);
+		const second = bucketRules(rules, mgr);
+
+		const count = (b: { rulebookRules: unknown[]; alwaysApplyRules: unknown[] }) =>
+			b.rulebookRules.length + b.alwaysApplyRules.length;
+		expect(count(first)).toBe(2);
+		expect(count(second)).toBe(count(first));
+	});
+
+	// TtsrManager.hasRule is the membership predicate bucketRules now gates on.
+	// It must be true for a registered rule (whether or not this call registered
+	// it), false for an unknown name, and false after a rejected addRule.
+	it("TtsrManager.hasRule reports membership independent of addRule's return", () => {
+		const mgr = new TtsrManager();
+		const rule = makeRule({ name: "no-foo", condition: ["FORBIDDEN"] });
+
+		expect(mgr.hasRule("no-foo")).toBe(false);
+		expect(mgr.addRule(rule)).toBe(true);
+		expect(mgr.hasRule("no-foo")).toBe(true);
+		// Idempotent: second add returns false, but membership persists.
+		expect(mgr.addRule(rule)).toBe(false);
+		expect(mgr.hasRule("no-foo")).toBe(true);
+		expect(mgr.hasRule("never-added")).toBe(false);
+	});
+
+	it("TtsrManager.hasRule stays false after a rejected addRule", () => {
+		const disabled = disabledManager();
+		expect(disabled.addRule(makeRule({ name: "no-foo", condition: ["FORBIDDEN"] }))).toBe(false);
+		expect(disabled.hasRule("no-foo")).toBe(false);
+
+		// Empty condition set is also rejected even when TTSR is enabled.
+		const enabled = new TtsrManager();
+		expect(enabled.addRule(makeRule({ name: "empty", description: "no conditions" }))).toBe(false);
+		expect(enabled.hasRule("empty")).toBe(false);
 	});
 });

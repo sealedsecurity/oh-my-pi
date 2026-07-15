@@ -495,6 +495,33 @@ export class Settings {
 		this.#fireAllHooks();
 	}
 
+	/**
+	 * Re-read every settings layer (global + project + overlays) from disk *in
+	 * place* and rebuild the merged view, WITHOUT writing anything back. This is
+	 * the in-session config-reload counterpart to {@link reloadForCwd}: it picks
+	 * up an on-disk edit to config.yml (a changed default model, a flipped
+	 * setting) that a running session would otherwise not see until restart.
+	 *
+	 * Pure re-READ — it delegates to {@link #loadReadOnly} (no `#load`, no
+	 * migration, no `#queueSave`/`#saveNow`), so config.yml is never rewritten.
+	 * This matters: the write path re-serializes the whole file, so a reload that
+	 * round-tripped through `set()` would reformat config.yml and strip comments
+	 * (the `/model` reformat footgun). Runtime `#overrides` (an in-session
+	 * `/model` pick, etc.) are the highest-precedence layer and survive untouched.
+	 *
+	 * Returns whether the merged view changed, so a caller can skip downstream
+	 * work (model re-resolve, prompt rebuild) on a no-op reload.
+	 */
+	async reload(): Promise<{ changed: boolean }> {
+		const prevModelRoles = this.get("modelRoles");
+		const before = JSON.stringify(this.#merged);
+		await this.#loadReadOnly();
+		const changed = JSON.stringify(this.#merged) !== before;
+		this.#fireEffectiveSettingChanged("modelRoles", this.get("modelRoles"), prevModelRoles);
+		this.#fireAllHooks();
+		return { changed };
+	}
+
 	// ─────────────────────────────────────────────────────────────────────────
 	// Accessors
 	// ─────────────────────────────────────────────────────────────────────────
