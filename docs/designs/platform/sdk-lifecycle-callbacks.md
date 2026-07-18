@@ -158,7 +158,14 @@ type RequestRestartResult =
 
    so the file the host re-opens reflects the full transcript.
 
-6. **Dispose, then invoke.** `await this.dispose()` (idempotent, single shared
+6. **Drain the refresh mutex, then dispose, then invoke.** First
+   `await this.#refreshTail` so any `refresh()` already inside its critical
+   section (a seconds-scale `onBeforeRefresh` pull) completes — its
+   `setActiveSkills`/`setActiveRules` swaps (`reload.ts:112`/`:122`, process-global)
+   land *before* the durable capture, so the persisted roster is the one the
+   replacement inherits. The `#restarting` latch (set in step 3) already refuses
+   *new* refreshes, so nothing chains on behind the drained one. Then
+   `await this.dispose()` (idempotent, single shared
    `#disposeCall` promise, `agent-session.ts:5861-5865`), then
    `await this.#onRestartRequested({ sessionId, sessionFile })`. OMP disposes
    first (Resolved decision (b)): create-before-dispose is unsafe in-process —
@@ -185,7 +192,10 @@ fire-and-forget `void this.agent.prompt`), an async-job completion enqueued to
 append past the durability barrier. So `requestRestart()` sets a `#restarting`
 latch *before* the wait and holds it through the callback: while latched the
 session refuses to begin a new turn (new prompts reject / no-op through the
-same guard the unbound path uses) and async-job delivery is paused: while
+same guard the unbound path uses), refuses to *start* a new `refresh()` (the
+lock acquirer early-returns while `#restarting` so no roster re-scan chains on
+behind the one restart drains in step 6 — an in-flight refresh is drained, a new
+one is turned away), and async-job delivery is paused: while
 `#restarting`, `onJobComplete` (`sdk.ts:1509-1522`) short-circuits before
 `session.yieldQueue.enqueue` (`sdk.ts:1515`), the same early-return shape as the
 existing `isDeliverySuppressed(jobId)` gate (`sdk.ts:1510-1512`), so a job that
@@ -351,6 +361,12 @@ any surface is swapped, so a hook throw releases the mutex with all
 roster/settings/MCP state untouched and no half-applied interleave visible to the
 next waiter.
 
+The same mutex is what `requestRestart()` drains: the restart latch refuses a
+*new* refresh (the acquirer early-returns while `#restarting`), and restart
+`await`s `#refreshTail` before dispose so an in-flight refresh's process-global
+`setActiveSkills`/`setActiveRules` swaps land in the captured roster rather than
+mutating state the replacement session inherits (Task 1 step 6, decision (e)).
+
 **Companion `onAfterRefresh` — not included.** A
 `(scope, result: RefreshResult) => void | Promise<void>` companion would give
 host observability, but `refresh()` already returns `RefreshResult`
@@ -446,9 +462,11 @@ through the `new AgentSession({ ... })` construction site (`sdk.ts:2863`).
 Implement `requestRestart()` on `AgentSession` with the sequence from the
 Approach: coalescing re-entrancy guard (shared `#restartCall`) → unbound guard →
 no-session-file guard → busy guard (`hasQueuedMessages()`) → set `#restarting`
-latch (refuse new turns, pause async-job delivery) → `waitForIdle()` → capture
+latch (refuse new turns *and* new refreshes, pause async-job delivery) →
+`waitForIdle()` → capture
 durable `getSessionId()` + `sessionFile` → `flush()` + `ensureOnDisk()` →
-`dispose()` → `await` callback → `{ ok: true }`.
+`await #refreshTail` (drain in-flight refresh; Task 2's mutex) → `dispose()` →
+`await` callback → `{ ok: true }`.
 
 Interfaces:
 
@@ -502,6 +520,12 @@ Test cycle (Tester agent, red → green):
   does NOT dispose when `agent.hasQueuedMessages()` is true at entry;
 - dispose-first: the session is disposed before the host callback fires (the
   callback observes a disposed session; OMP does not write the file afterward).
+- refresh coordination (regression for the drain/refuse gap): with a slow
+  `onBeforeRefresh` hook in flight, a concurrent `requestRestart()` awaits the
+  in-flight `refresh()` (its `applyReloadedSkills`/roster swaps complete) before
+  dispose, AND a `refresh()` *started* after the `#restarting` latch is set
+  early-returns without re-scanning — assert restart does not dispose until the
+  in-flight refresh settles, and the post-latch refresh performs no swap.
 
 ### Task 2 — `onBeforeRefresh` option + refresh mutex, threaded into `refresh()`
 
@@ -686,11 +710,13 @@ Test cycle (Tester agent, red → green):
 ## Tasks
 
 - [ ] Task 1 — `onRestartRequested` option + `AgentSession.requestRestart()`
-      (re-entrancy + busy guards, latch, capture, durability barrier, dispose,
-      awaited callback; tests)
+      (re-entrancy + busy guards, latch that also refuses new refreshes, capture,
+      durability barrier, drain `#refreshTail` before dispose, dispose, awaited
+      callback; tests) — the drain/refuse depends on Task 2's `#refreshTail`
 - [ ] Task 2 — `onBeforeRefresh` option + refresh mutex, threaded into
       `AgentSession.refresh()` (serialized critical section, awaited hook,
-      propagate-on-throw + lock-release, no-op unset; tests)
+      propagate-on-throw + lock-release, no-op unset, acquirer early-returns while
+      `#restarting`; tests)
 - [ ] Task 3 — SDK wiring through `createAgentSession` + host-recipe docs
       (integration tests)
 - [ ] Task 4 — model-callable `restart` tool (`approval: "exec"`, untracked
@@ -760,9 +786,14 @@ it also misses in-flight starts that `isStreaming` counts via
 not, and in-memory steering/follow-up queues (`agent.hasQueuedMessages()`, the
 raw `#steeringQueue`/`#followUpQueue` predicate at `packages/agent/src/agent.ts:888-890`,
 not the displayable-filtered `sdk.ts:2208` field) are never persisted. So `requestRestart()` sets a `#restarting`
-latch before the wait (refusing new turns and pausing async-job delivery through
-the callback) and refuses with `{ ok: false, reason: "busy" }` when input is
-queued at entry. This makes the durability promise true for the always-on agents
+latch before the wait (refusing new turns, refusing to *start* a new `refresh()`,
+and pausing async-job delivery through the callback) and refuses with
+`{ ok: false, reason: "busy" }` when input is queued at entry. Because the latch
+turns away only *new* refreshes, restart also `await`s `#refreshTail` before
+dispose (Task 1 step 6) to drain a refresh already in its critical section — its
+process-global `setActiveSkills`/`setActiveRules` swaps (`reload.ts:112`/`:122`)
+must settle into the captured roster, not mutate the state the replacement
+inherits (decision (g)). This makes the durability promise true for the always-on agents
 Compass drives (Dispatcher / Warden, `compass.md` §4.2/§4.3), which cannot
 guarantee external idleness. Rejected: snapshot + documented "call only when
 externally idle" precondition — cheap, but an always-on multi-tenant host cannot
