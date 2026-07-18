@@ -160,11 +160,19 @@ type RequestRestartResult =
 
 6. **Drain the refresh mutex, then dispose, then invoke.** First
    `await this.#refreshTail` so any `refresh()` already inside its critical
-   section (a seconds-scale `onBeforeRefresh` pull) completes — its
-   `setActiveSkills`/`setActiveRules` swaps (`reload.ts:112`/`:122`, process-global)
-   land *before* the durable capture, so the persisted roster is the one the
-   replacement inherits. The `#restarting` latch (set in step 3) already refuses
-   *new* refreshes, so nothing chains on behind the drained one. Then
+   section (a seconds-scale `onBeforeRefresh` pull) completes. Its
+   `setActiveSkills`/`setActiveRules` swaps (`reload.ts:112`/`:122`) mutate
+   in-memory process globals — they are *not* persisted, and the replacement
+   re-scans disk and re-swaps the globals itself at construction
+   (`setActiveSkills`/`setActiveRules`, `sdk.ts:1681`/`:1686`). Draining before
+   dispose therefore guards two in-memory races, not the session file: (i) the
+   refresh's `onBeforeRefresh` disk writes settle before the replacement
+   re-scans them, and (ii) the refresh's `applyReloadedSkills` fan-out
+   (`agent-session.ts:7007`, which writes `#skills` into every registered
+   session) completes while only the old session is registered, so it cannot
+   clobber the replacement's freshly-scanned `#skills` once the host creates and
+   registers it. The `#restarting` latch (set in step 3) already refuses *new*
+   refreshes, so nothing chains on behind the drained one. Then
    `await this.dispose()` (idempotent, single shared
    `#disposeCall` promise, `agent-session.ts:5861-5865`), then
    `await this.#onRestartRequested({ sessionId, sessionFile })`. OMP disposes
@@ -193,9 +201,10 @@ append past the durability barrier. So `requestRestart()` sets a `#restarting`
 latch *before* the wait and holds it through the callback: while latched the
 session refuses to begin a new turn (new prompts reject / no-op through the
 same guard the unbound path uses), refuses to *start* a new `refresh()` (the
-lock acquirer early-returns while `#restarting` so no roster re-scan chains on
-behind the one restart drains in step 6 — an in-flight refresh is drained, a new
-one is turned away), and async-job delivery is paused: while
+lock acquirer early-returns `{ refused: "restarting" }` while `#restarting`, so
+no roster re-scan chains on behind the one restart drains in step 6 — an
+in-flight refresh is drained, a new one is turned away with an explicit refusal
+rather than a silent no-op), and async-job delivery is paused: while
 `#restarting`, `onJobComplete` (`sdk.ts:1509-1522`) short-circuits before
 `session.yieldQueue.enqueue` (`sdk.ts:1515`), the same early-return shape as the
 existing `isDeliverySuppressed(jobId)` gate (`sdk.ts:1510-1512`), so a job that
@@ -311,6 +320,9 @@ today), so the hook, every re-scan, and every swap are all under the one lock:
 
 ```ts
 async refresh(scope: RefreshScope = "all"): Promise<RefreshResult> {
+    // restart in progress: refuse a new refresh so nothing chains on behind the
+    // one restart drains, and report the refusal (not a silent no-op).
+    if (this.#restarting) return { refused: "restarting" };
     // serialize: chain onto the tail so overlapping callers run in order
     const run = this.#refreshTail.then(() => this.#doRefresh(scope));
     this.#refreshTail = run.then(() => {}, () => {}); // never reject the tail
@@ -362,10 +374,13 @@ roster/settings/MCP state untouched and no half-applied interleave visible to th
 next waiter.
 
 The same mutex is what `requestRestart()` drains: the restart latch refuses a
-*new* refresh (the acquirer early-returns while `#restarting`), and restart
-`await`s `#refreshTail` before dispose so an in-flight refresh's process-global
-`setActiveSkills`/`setActiveRules` swaps land in the captured roster rather than
-mutating state the replacement session inherits (Task 1 step 6, decision (e)).
+*new* refresh (the acquirer early-returns `{ refused: "restarting" }` while
+`#restarting`), and restart
+`await`s `#refreshTail` before dispose so an in-flight refresh's
+`applyReloadedSkills` fan-out and `onBeforeRefresh` disk writes complete while
+only the old session is registered — they cannot clobber the freshly-scanned
+`#skills`/on-disk config the replacement re-reads for itself (Task 1 step 6,
+decision (e)).
 
 **Companion `onAfterRefresh` — not included.** A
 `(scope, result: RefreshResult) => void | Promise<void>` companion would give
@@ -550,6 +565,10 @@ onBeforeRefresh?: (scope: RefreshScope) => void | Promise<void>;
 // agent-session.ts — AgentSession private mutex tail
 #refreshTail: Promise<unknown> = Promise.resolve();
 
+// extensibility/reload.ts — RefreshResult gains a refusal marker so a refresh
+// refused while #restarting is distinguishable from a successful no-op
+refused?: "restarting";
+
 // agent-session.ts — refresh() chains onto the tail, delegates to #doRefresh;
 // onBeforeRefresh is the first statement inside #doRefresh (the critical section)
 if (this.#onBeforeRefresh) await this.#onBeforeRefresh(scope);
@@ -584,6 +603,9 @@ Test cycle (Tester agent, red → green):
 - mutex survives a throwing refresh: a first refresh whose hook rejects still
   releases the lock, and a subsequent `refresh()` runs normally (the tail never
   stays rejected).
+- restart refusal: while `#restarting` is set, `refresh()` returns
+  `{ refused: "restarting" }` without chaining onto `#refreshTail` or re-scanning
+  (assert no `onBeforeRefresh` call, no surface swap, and the marker is present).
 
 ### Task 3 — SDK wiring + docs
 
@@ -715,8 +737,8 @@ Test cycle (Tester agent, red → green):
       callback; tests) — the drain/refuse depends on Task 2's `#refreshTail`
 - [ ] Task 2 — `onBeforeRefresh` option + refresh mutex, threaded into
       `AgentSession.refresh()` (serialized critical section, awaited hook,
-      propagate-on-throw + lock-release, no-op unset, acquirer early-returns while
-      `#restarting`; tests)
+      propagate-on-throw + lock-release, no-op unset, acquirer early-returns
+      `{ refused: "restarting" }` while `#restarting`; tests)
 - [ ] Task 3 — SDK wiring through `createAgentSession` + host-recipe docs
       (integration tests)
 - [ ] Task 4 — model-callable `restart` tool (`approval: "exec"`, untracked
@@ -774,6 +796,12 @@ ship the widened race unclosed. `RefreshTool`'s `concurrency: "exclusive"`
 (`tools/refresh.ts:67`) is not sufficient — it only serializes within one agent's
 tool batch, not against host-driven or `/refresh` calls.
 
+A refresh refused because a restart is in progress returns
+`{ refused: "restarting" }` (a new `RefreshResult` marker) rather than an empty
+result, so a caller (`RefreshTool` / `/refresh`) can tell a refused refresh from
+a successful no-op — the same anti-silent-lie stance as the hook-throw error
+semantics above.
+
 ### (e) Restart latch — `requestRestart()` latches, not just waits
 
 `waitForIdle()` (`agent-session.ts:6086-6089`) is a *wait*, not a *latch*: after
@@ -791,9 +819,9 @@ and pausing async-job delivery through the callback) and refuses with
 `{ ok: false, reason: "busy" }` when input is queued at entry. Because the latch
 turns away only *new* refreshes, restart also `await`s `#refreshTail` before
 dispose (Task 1 step 6) to drain a refresh already in its critical section — its
-process-global `setActiveSkills`/`setActiveRules` swaps (`reload.ts:112`/`:122`)
-must settle into the captured roster, not mutate the state the replacement
-inherits (decision (g)). This makes the durability promise true for the always-on agents
+in-memory `applyReloadedSkills` fan-out and `onBeforeRefresh` disk writes must
+complete while only the old session is registered, so they cannot clobber the
+`#skills`/config the replacement re-scans for itself (decision (g)). This makes the durability promise true for the always-on agents
 Compass drives (Dispatcher / Warden, `compass.md` §4.2/§4.3), which cannot
 guarantee external idleness. Rejected: snapshot + documented "call only when
 externally idle" precondition — cheap, but an always-on multi-tenant host cannot
