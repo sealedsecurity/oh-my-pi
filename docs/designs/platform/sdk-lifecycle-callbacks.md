@@ -136,8 +136,9 @@ type RequestRestartResult =
    transcript is complete before capture. The host typically calls
    `requestRestart()` from outside a turn; the model-callable `restart` tool
    drives it too, from an untracked continuation (Task 4) that reports
-   pre-dispose refusals to the transcript and propagates a post-dispose throw to
-   the host caller.
+   pre-dispose refusals to the transcript; a post-dispose throw there has no
+   awaiting caller, so the continuation catches and logs it (recovery is via the
+   durable session file, not the closed transcript).
 
 4. **Capture the durable re-attach identity** — `sessionManager.getSessionId()`
    (`session-manager.ts:1295-1297`, the file-preserved `#sessionId`) and
@@ -182,9 +183,10 @@ type RequestRestartResult =
    and the lock-free append writer (`session-storage.ts`) would leave two writers
    on one file. Dispose flips ownership of both cleanly before the host re-creates.
 
-7. Return `{ ok: true }`. A throwing callback propagates to the
-   `requestRestart()` caller — the host's own hook failed; OMP must not
-   swallow it.
+7. Return `{ ok: true }`. A throwing callback rejects the `requestRestart()`
+   call — the host's own hook failed; OMP must not swallow it. Who receives that
+   rejection splits by path (direct host `await` vs. the model tool's untracked
+   catch-and-log) — see decision (a) and Task 4.
 
 **Re-entrancy.** `requestRestart()` coalesces onto a single shared
 `#restartCall` promise: a second call while one is in flight returns the same
@@ -404,8 +406,10 @@ A model-callable `restart` tool is included (Resolved decision (a), Task 4):
 write), guarded on the callback being bound, and — critically — it neither
 inline-awaits `requestRestart()` nor schedules it as a tracked post-prompt task
 (both self-deadlock): it fires the call from an untracked continuation and
-reports pre-dispose refusals to the transcript, propagating a post-dispose throw
-to the host caller (Task 4). Restart is
+reports pre-dispose refusals to the transcript. On the direct path the host
+`await`s `requestRestart()` and a post-dispose throw rejects to it; on the model
+path the continuation has no awaiting caller, so it catches the throw and logs it
+(recovery via the durable session file — Task 4). Restart is
 also drivable host-side directly (`session.requestRestart()` from the embedding
 daemon).
 
@@ -686,8 +690,13 @@ Two mechanisms are wrong; the third is the contract.
   still-open transcript as a system notice, so the model sees them. A
   **post-dispose failure** — the host callback throwing after dispose closed the
   append writer (`session-manager.ts:1246`) — has no transcript left to append
-  to; it propagates as `requestRestart()`'s rejection to the host caller
-  (step 7), which owns re-attach and recovery. The `execute()` ack means
+  to. `requestRestart()` still rejects, but who receives it splits by path: on
+  the direct SDK path the host `await`s the call and owns re-attach/recovery
+  (step 7); on the model path the continuation is untracked with no awaiting
+  caller, so it attaches `.catch(err => logger.error(...))` (OMP's fire-and-forget
+  pattern, `agent-session.ts:2100`/`:4318`) — the failure is operator-visible via
+  the log, and recovery is via the durable session file flushed at step 5, since
+  dispose has closed the transcript. The `execute()` ack means
   "scheduled", not "restarted". `RefreshTool` is NOT a valid template —
   `session.refresh()` (`sdk.ts:1631`) never waits for turn idle, so it can be
   awaited inline; restart cannot.
@@ -704,7 +713,8 @@ export class RestartTool
     // execute(): guard the binding, return an acknowledgement result, then fire
     // requestRestart() from an UNTRACKED continuation (never through
     // #schedulePostPromptTask). Report pre-dispose refusals to the transcript;
-    // a post-dispose callback throw rejects to the host caller (step 7).
+    // a post-dispose callback throw has no awaiting caller here — catch + log it
+    // (recovery via the durable session file), do not leave it unhandled.
 }
 
 // tools/index.ts — ToolSession (next to refresh, index.ts:390)
@@ -724,8 +734,9 @@ Test cycle (Tester agent, red → green):
 - reports the real outcome, split on dispose ordering: a pre-dispose refusal
   (`{ ok: false, reason: "busy" }`, input queued after the ack) is surfaced to
   the still-open transcript, not swallowed behind the `execute()` success ack; a
-  post-dispose host-callback throw rejects `requestRestart()` to the host caller
-  (the append writer is already closed — assert it does not silently vanish);
+  post-dispose host-callback throw on the model path is caught and logged (no
+  awaiting caller; assert it neither goes unhandled nor silently vanishes, and
+  the durable session file remains re-attachable);
 - requires exec approval (mirror `refresh-tool.test.ts`'s
   `requiresApproval` coverage).
 
@@ -760,8 +771,9 @@ bound, mirroring how `refresh` guards on `session.refresh`
 never a tracked `#postPromptTask` — both deadlock; see Task 4). Reporting splits
 on dispose ordering: a pre-dispose refusal
 (`busy`/`unavailable`/`no-session-file`) is written to the still-open transcript
-so the model sees it; a post-dispose callback throw rejects to the host caller
-(which owns re-attach), since dispose has already closed the transcript.
+so the model sees it; a post-dispose callback throw has no awaiting caller on the
+model path, so the untracked continuation catches and logs it (recovery via the
+durable session file), since dispose has already closed the transcript.
 
 ### (b) Teardown ordering — OMP disposes before the callback
 
