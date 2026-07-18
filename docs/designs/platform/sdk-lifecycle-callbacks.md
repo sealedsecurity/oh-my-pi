@@ -705,8 +705,9 @@ Two mechanisms are wrong; the third is the contract.
   (step 7); on the model path the continuation is untracked with no awaiting
   caller, so it attaches `.catch(err => logger.error(...))`, following OMP's
   fire-and-forget catch+log pattern — the IRC wake at `agent-session.ts:2100`
-  (`void this.agent.prompt(...).catch(logger.warn)`), explicitly not the empty
-  `.catch(() => {})` swallow at `#trackPostPromptTask` (`:4318`), which would
+  (`void this.agent.prompt(...).catch(logger.warn)`; warn there for a recoverable
+  wake, error here because a lost restart is not recoverable), explicitly not the
+  empty `.catch(() => {})` swallow at `#trackPostPromptTask` (`:4319`), which would
   re-hide the failure this catch exists to surface. The failure is operator-visible via
   the log, and recovery is via the durable session file flushed at step 5, since
   dispose has closed the transcript. The `execute()` ack means
