@@ -135,8 +135,9 @@ type RequestRestartResult =
    — "Wait until streaming and deferred recovery work are fully settled") so the
    transcript is complete before capture. The host typically calls
    `requestRestart()` from outside a turn; the model-callable `restart` tool
-   drives it too, from an untracked post-drain continuation that reports the
-   result back to the transcript (Task 4).
+   drives it too, from an untracked continuation (Task 4) that reports
+   pre-dispose refusals to the transcript and propagates a post-dispose throw to
+   the host caller.
 
 4. **Capture the durable re-attach identity** — `sessionManager.getSessionId()`
    (`session-manager.ts:1295-1297`, the file-preserved `#sessionId`) and
@@ -371,8 +372,9 @@ A model-callable `restart` tool is included (Resolved decision (a), Task 4):
 `approval: "exec"` (auto-runs only in yolo mode; always prompts in always-ask /
 write), guarded on the callback being bound, and — critically — it neither
 inline-awaits `requestRestart()` nor schedules it as a tracked post-prompt task
-(both self-deadlock): it fires the call from an untracked post-drain continuation
-and reports the result (Task 4). Restart is
+(both self-deadlock): it fires the call from an untracked continuation and
+reports pre-dispose refusals to the transcript, propagating a post-dispose throw
+to the host caller (Task 4). Restart is
 also drivable host-side directly (`session.requestRestart()` from the embedding
 daemon).
 
@@ -619,16 +621,28 @@ Two mechanisms are wrong; the third is the contract.
   awaited → self-deadlock. `#schedulePostPromptTask`'s `AbortSignal` (`:4333`)
   does not rescue it: the task is synchronously deep in `waitForIdle`/`dispose`,
   not parked at an abort checkpoint.
-- *Untracked post-drain hook (the contract).* `execute()` returns immediately
-  with an acknowledgement, then fires `requestRestart()` from a continuation that
-  runs *after* the post-prompt phase has fully drained and is **not** registered
-  in `#postPromptTasks` (a raw `queueMicrotask`/`setTimeout` on the turn-idle
-  transition, never through `#schedulePostPromptTask`). Because it runs once the
-  tracked set is already empty, nothing it awaits includes itself. The same
-  continuation carries the resolved `RequestRestartResult` back to the transcript
-  as a system notice (a later `{ ok: false, reason: "busy" }`, an abort, or a
-  throwing host callback must be model-visible — the `execute()` ack only means
-  "scheduled", not "restarted"). `RefreshTool` is NOT a valid template —
+- *Untracked continuation (the contract).* `execute()` returns immediately
+  with an acknowledgement, then fires `requestRestart()` from a continuation
+  **not** registered in `#postPromptTasks` (never through
+  `#schedulePostPromptTask`, which always tracks — `:4352`→`:4316`).
+  Deadlock-freedom comes from that untracked-ness, *not* from timing: absent
+  from `#postPromptTasks`, the continuation sits in neither set
+  `requestRestart()` drains — `#waitForPostPromptRecovery`'s
+  `await #postPromptTasksPromise` (`:4470-4471`) nor `dispose()`'s
+  `Promise.allSettled` (`:4438`/`:4444`) — so its own step-3 `waitForIdle()`
+  and step-6 `dispose()` await a set that structurally excludes it.
+  (`requestRestart()`'s step-3 `waitForIdle()` supplies the "let this turn
+  settle" wait, so the continuation need only be untracked, fired at the
+  post-prompt idle transition — not a bare `queueMicrotask` inside `execute()`
+  masquerading as post-drain.) Result reporting splits on dispose ordering: the
+  **pre-dispose refusals** (`{ ok: false, reason: "busy" | "unavailable" |
+  "no-session-file" }`, all returned before step-6 dispose) are written to the
+  still-open transcript as a system notice, so the model sees them. A
+  **post-dispose failure** — the host callback throwing after dispose closed the
+  append writer (`session-manager.ts:1246`) — has no transcript left to append
+  to; it propagates as `requestRestart()`'s rejection to the host caller
+  (step 7), which owns re-attach and recovery. The `execute()` ack means
+  "scheduled", not "restarted". `RefreshTool` is NOT a valid template —
   `session.refresh()` (`sdk.ts:1631`) never waits for turn idle, so it can be
   awaited inline; restart cannot.
 
@@ -642,9 +656,9 @@ export class RestartTool
     readonly name = "restart";
     readonly approval = "exec" as const;
     // execute(): guard the binding, return an acknowledgement result, then fire
-    // requestRestart() from an UNTRACKED post-drain continuation (never through
-    // #schedulePostPromptTask) and report its RequestRestartResult back to the
-    // transcript.
+    // requestRestart() from an UNTRACKED continuation (never through
+    // #schedulePostPromptTask). Report pre-dispose refusals to the transcript;
+    // a post-dispose callback throw rejects to the host caller (step 7).
 }
 
 // tools/index.ts — ToolSession (next to refresh, index.ts:390)
@@ -661,10 +675,11 @@ Test cycle (Tester agent, red → green):
   trap: the scheduled restart must complete — a version that enqueues it into
   `#postPromptTasks` hangs here (self-inclusion in the drained set), so the test
   fails closed if an executor reaches for `#schedulePostPromptTask`;
-- reports the real outcome: when `requestRestart()` resolves
-  `{ ok: false, reason: "busy" }` (input queued after the ack) or the host
-  callback throws, the failure is surfaced to the transcript, not swallowed
-  behind the `execute()` success ack;
+- reports the real outcome, split on dispose ordering: a pre-dispose refusal
+  (`{ ok: false, reason: "busy" }`, input queued after the ack) is surfaced to
+  the still-open transcript, not swallowed behind the `execute()` success ack; a
+  post-dispose host-callback throw rejects `requestRestart()` to the host caller
+  (the append writer is already closed — assert it does not silently vanish);
 - requires exec approval (mirror `refresh-tool.test.ts`'s
   `requiresApproval` coverage).
 
@@ -693,10 +708,12 @@ host-driven `session.requestRestart()`. `approval: "exec"` (auto-runs only in
 yolo mode; always prompts in always-ask / write), guarded on the callback being
 bound, mirroring how `refresh` guards on `session.refresh`
 (`tools/refresh.ts:78`). The tool returns an acknowledgement, then fires
-`requestRestart()` from an untracked post-drain continuation (never an inline
-await, and never a tracked `#postPromptTask` — both deadlock; see Task 4), and
-reports the resolved `RequestRestartResult` back to the transcript so a later
-`busy`/abort/callback-throw is model-visible rather than hidden behind the ack.
+`requestRestart()` from an untracked continuation (never an inline await, and
+never a tracked `#postPromptTask` — both deadlock; see Task 4). Reporting splits
+on dispose ordering: a pre-dispose refusal
+(`busy`/`unavailable`/`no-session-file`) is written to the still-open transcript
+so the model sees it; a post-dispose callback throw rejects to the host caller
+(which owns re-attach), since dispose has already closed the transcript.
 
 ### (b) Teardown ordering — OMP disposes before the callback
 
