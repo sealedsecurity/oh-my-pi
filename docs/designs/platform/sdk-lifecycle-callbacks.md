@@ -135,7 +135,8 @@ type RequestRestartResult =
    — "Wait until streaming and deferred recovery work are fully settled") so the
    transcript is complete before capture. The host typically calls
    `requestRestart()` from outside a turn; the model-callable `restart` tool
-   drives it too, and records its result before the scheduled call runs (Task 4).
+   drives it too, from an untracked post-drain continuation that reports the
+   result back to the transcript (Task 4).
 
 4. **Capture the durable re-attach identity** — `sessionManager.getSessionId()`
    (`session-manager.ts:1295-1297`, the file-preserved `#sessionId`) and
@@ -183,14 +184,25 @@ fire-and-forget `void this.agent.prompt`), an async-job completion enqueued to
 append past the durability barrier. So `requestRestart()` sets a `#restarting`
 latch *before* the wait and holds it through the callback: while latched the
 session refuses to begin a new turn (new prompts reject / no-op through the
-same guard the unbound path uses) and async-job delivery is paused. Parked
+same guard the unbound path uses) and async-job delivery is paused: while
+`#restarting`, `onJobComplete` (`sdk.ts:1509-1522`) short-circuits before
+`session.yieldQueue.enqueue` (`sdk.ts:1515`), the same early-return shape as the
+existing `isDeliverySuppressed(jobId)` gate (`sdk.ts:1510-1512`), so a job that
+finishes mid-recycle holds its delivery instead of waking a new turn. Parked
 in-memory input is not silently dropped: if `agent.hasQueuedMessages()`
-(`sdk.ts:2208`) is true at entry, `requestRestart()` returns
+(`packages/agent/src/agent.ts:888`) is true at entry, `requestRestart()` returns
 `{ ok: false, reason: "busy" }` rather than recycling over queued steering /
-follow-up messages that are not yet persisted. This makes the durability
-promise ("the file the host re-opens is the full transcript") true for the
-always-on agents Compass drives (Dispatcher / Warden, `compass.md` §4.2/§4.3),
-which cannot guarantee external idleness. `{ ok: true }` still means "the
+follow-up messages that are not yet persisted. The guard uses the **raw** method
+(`#steeringQueue.length > 0 || #followUpQueue.length > 0`,
+`packages/agent/src/agent.ts:888-890`), NOT the displayable-filtered
+`session.queuedMessageCount` (`agent-session.ts:8825-8829`, which the SDK
+`SessionContext.hasQueuedMessages` field at `sdk.ts:2208` wraps): a
+non-displayable queued steer must still block restart, or the durability promise
+leaks in exactly the multi-tenant deployment this serves. This makes that promise
+("the file the host re-opens is the full transcript") true for the always-on
+agents Compass drives (Dispatcher / Warden, `compass.md` §4.2/§4.3, a repo
+outside this tree — see decision (f)), which cannot guarantee external idleness.
+`{ ok: true }` still means "the
 callback returned"; the host's re-attach is what completes the restart.
 
 **Host re-attach recipe** (documented on the option): OMP has already disposed
@@ -280,21 +292,33 @@ export const REFRESH_SCOPES = ["skills", "rules", "settings", "mcp", "all"] as c
 export type RefreshScope = (typeof REFRESH_SCOPES)[number];
 ```
 
-**Threading.** `AgentSession.refresh(scope)` (`agent-session.ts:6912`) gains an
-awaited call at the very top, before the `doRoster`/`doSettings`/`doMcp`
-branches (`agent-session.ts:6913-6915`):
+**Threading.** `AgentSession.refresh(scope)` becomes a thin lock acquirer that
+chains onto the refresh mutex and delegates to a private `#doRefresh(scope)`; the
+`onBeforeRefresh` hook is the first statement *inside* the critical section,
+before the `doRoster`/`doSettings`/`doMcp` branches (`agent-session.ts:6912-6915`
+today), so the hook, every re-scan, and every swap are all under the one lock:
 
 ```ts
 async refresh(scope: RefreshScope = "all"): Promise<RefreshResult> {
+    // serialize: chain onto the tail so overlapping callers run in order
+    const run = this.#refreshTail.then(() => this.#doRefresh(scope));
+    this.#refreshTail = run.then(() => {}, () => {}); // never reject the tail
+    return run;
+}
+
+async #doRefresh(scope: RefreshScope): Promise<RefreshResult> {
     if (this.#onBeforeRefresh) await this.#onBeforeRefresh(scope);
     const doRoster = scope === "all" || scope === "skills" || scope === "rules";
+    // ...existing re-scan / swap body...
+}
 ```
 
 Because it lives inside `refresh()` itself, it fires for every surface that
 drives a refresh: the model-callable `RefreshTool`
 (`tools/refresh.ts:85`, `await this.session.refresh(scope)` via the
 `ToolSession.refresh` binding at `sdk.ts:1631`), the `/refresh` command path
-(`modes/controllers/command-controller.ts:629-630`), and direct SDK calls.
+(`slash-commands/builtin-registry.ts:1468`, `await runtime.session.refresh(scope)`),
+and direct SDK calls.
 
 **Error semantics: propagate.** If the host's pull throws, the refresh aborts
 and the error reaches the refresh caller (the RefreshTool already surfaces
@@ -302,16 +326,29 @@ errors as tool errors). Rationale: a failed pull means the disk state is not
 what the host intended; silently re-scanning stale disk would report a
 "successful" refresh of the wrong content.
 
-**Concurrency (non-guarantee).** `refresh()` has no mutex today, and the hook
-widens the window: awaiting a host network pull at the top stretches a
-millisecond-scale re-scan into a seconds-scale one, during which a second
-`refresh()` (model `RefreshTool`, `/refresh`, or a direct host call) can race —
-`RefreshTool`'s `concurrency: "exclusive"` (`tools/refresh.ts:67`) only
-serializes within one agent's tool batch, not against host-driven calls. This
-race pre-exists the hook; the hook does not create it and this record does not
-fix it (a refresh mutex is out of scope). The abort guarantee is unaffected:
-the hook is the first statement of `refresh()`, before any surface is swapped,
-so a hook throw leaves all roster/settings/MCP state untouched.
+**Concurrency — serialized via an in-session refresh mutex.** `refresh()` has no
+mutex today, and the hook widens the window: awaiting a host network pull at the
+top stretches a millisecond-scale re-scan into a seconds-scale one, during which
+a second `refresh()` (model `RefreshTool`, `/refresh`, or a direct host call) can
+enter. `RefreshTool`'s `concurrency: "exclusive"` (`tools/refresh.ts:67`) only
+serializes within one agent's tool batch, not against host-driven calls, so two
+overlapping refreshes could interleave the separate `setActiveSkills`/
+`setActiveRules`/settings/MCP swaps and leave the process holding skills from
+pull A beside rules from pull B. Because the hook makes this window
+deployment-real for the always-on multi-tenant target, this record closes it:
+`refresh()` acquires a session-level mutex spanning the **whole** operation —
+`onBeforeRefresh` hook, every disk re-scan, and every surface swap — so
+concurrent callers run strictly one-at-a-time and each sees a fully-applied prior
+refresh. The mechanism is a private promise-tail chain (`#refreshTail =
+#refreshTail.then(runThisRefresh)`), the *serializing* sibling of the
+*coalescing* `#disposeCall`/`#restartCall` guard (`agent-session.ts:5861-5865`):
+coalescing dedupes to one shared result, but two refreshes of different scopes
+must both run, in order, so the tail chains rather than shares. Each caller still
+gets its own `RefreshResult`. The abort guarantee is unaffected and now
+lock-backed: the hook is the first statement inside the critical section, before
+any surface is swapped, so a hook throw releases the mutex with all
+roster/settings/MCP state untouched and no half-applied interleave visible to the
+next waiter.
 
 **Companion `onAfterRefresh` — not included.** A
 `(scope, result: RefreshResult) => void | Promise<void>` companion would give
@@ -332,8 +369,10 @@ them as `#onRestartRequested` / `#onBeforeRefresh` privates.
 
 A model-callable `restart` tool is included (Resolved decision (a), Task 4):
 `approval: "exec"` (auto-runs only in yolo mode; always prompts in always-ask /
-write), guarded on the callback being bound, and — critically — it does not
-inline-await `requestRestart()` but schedules it post-turn (Task 4). Restart is
+write), guarded on the callback being bound, and — critically — it neither
+inline-awaits `requestRestart()` nor schedules it as a tracked post-prompt task
+(both self-deadlock): it fires the call from an untracked post-drain continuation
+and reports the result (Task 4). Restart is
 also drivable host-side directly (`session.requestRestart()` from the embedding
 daemon).
 
@@ -462,12 +501,16 @@ Test cycle (Tester agent, red → green):
 - dispose-first: the session is disposed before the host callback fires (the
   callback observes a disposed session; OMP does not write the file afterward).
 
-### Task 2 — `onBeforeRefresh` option threaded into `refresh()`
+### Task 2 — `onBeforeRefresh` option + refresh mutex, threaded into `refresh()`
 
 Add the option to `CreateAgentSessionOptions` and `AgentSessionConfig`; store
-as `#onBeforeRefresh`; insert the awaited call as the first statement of
-`AgentSession.refresh()` (`agent-session.ts:6912`), before the
-`doRoster`/`doSettings`/`doMcp` scope flags are computed.
+as `#onBeforeRefresh`. Split `refresh()` into a thin lock acquirer that chains
+onto a private `#refreshTail` mutex and a `#doRefresh(scope)` critical section;
+make the awaited `onBeforeRefresh` call the first statement of `#doRefresh`,
+before the `doRoster`/`doSettings`/`doMcp` scope flags are computed
+(`agent-session.ts:6912-6915` today). The mutex spans the hook, every re-scan,
+and every surface swap, so overlapping refreshes cannot interleave (see
+Approach → Concurrency).
 
 Interfaces:
 
@@ -478,13 +521,19 @@ onBeforeRefresh?: (scope: RefreshScope) => void | Promise<void>;
 // agent-session.ts — AgentSessionConfig
 onBeforeRefresh?: (scope: RefreshScope) => void | Promise<void>;
 
-// agent-session.ts — inside refresh(), first statement
+// agent-session.ts — AgentSession private mutex tail
+#refreshTail: Promise<unknown> = Promise.resolve();
+
+// agent-session.ts — refresh() chains onto the tail, delegates to #doRefresh;
+// onBeforeRefresh is the first statement inside #doRefresh (the critical section)
 if (this.#onBeforeRefresh) await this.#onBeforeRefresh(scope);
 ```
 
-Consumes: `RefreshScope` (`extensibility/reload.ts:32-33`). Produces: awaited
-pre-hook before any disk re-scan; rejection aborts the refresh and propagates
-to the caller (RefreshTool / `/refresh` / direct SDK call).
+Consumes: `RefreshScope` (`extensibility/reload.ts:32-33`). Produces: a
+serialized `refresh()` whose critical section opens with the awaited pre-hook
+before any disk re-scan; rejection aborts that refresh and propagates to the
+caller (RefreshTool / `/refresh` / direct SDK call) while releasing the mutex for
+the next waiter.
 
 Test cycle (Tester agent, red → green):
 
@@ -500,7 +549,15 @@ Test cycle (Tester agent, red → green):
 - a throwing hook rejects `refresh()` and no surface is re-read (roster
   globals unchanged);
 - hook fires on the RefreshTool path too (`RefreshTool.execute` →
-  `session.refresh`, `tools/refresh.ts:85`).
+  `session.refresh`, `tools/refresh.ts:85`);
+- mutex serializes overlapping refreshes: with a hook that blocks on a released
+  gate, start `refresh("skills")` then `refresh("rules")` before releasing —
+  assert the second hook does not start until the first refresh fully resolves
+  (record hook-enter / refresh-exit ordering), so no interleave of the separate
+  surface swaps;
+- mutex survives a throwing refresh: a first refresh whose hook rejects still
+  releases the lock, and a subsequent `refresh()` runs normally (the tail never
+  stays rejected).
 
 ### Task 3 — SDK wiring + docs
 
@@ -542,17 +599,38 @@ mode; always prompts in always-ask / write — same tier and reasoning as
 exactly as RefreshTool guards on `session.refresh` (`tools/refresh.ts:78`),
 returning "Restart is unavailable in this session." when unbound.
 
-**Critical shape: the tool must NOT inline-await `requestRestart()`.** Step 3
-of the sequence is `await waitForIdle()`, which resolves only when the current
-turn settles — but the turn cannot settle while it is blocked inside the tool's
-`execute()`. An inline await is a circular wait that hangs the turn forever.
-Instead the tool records its result and schedules the restart to run *after*
-the turn via the post-prompt scheduler (`#schedulePostPromptTask`,
-`agent-session.ts:4328-4353`): `execute()` returns immediately with an
-acknowledgement, then the scheduled task calls `requestRestart()` once the loop
-is idle. `RefreshTool` is NOT a valid template here — `session.refresh()`
-(`sdk.ts:1631`) never waits for turn idle, so it can be awaited inline; restart
-cannot.
+**Critical shape: run `requestRestart()` from an untracked post-drain hook.**
+Two mechanisms are wrong; the third is the contract.
+
+- *Inline await (wrong).* Step 3 of the sequence is `await waitForIdle()`, which
+  resolves only when the current turn settles — but the turn cannot settle while
+  it is blocked inside the tool's `execute()`. A circular wait that hangs the
+  turn forever.
+- *Tracked post-prompt task (also wrong — the subtle one).* Scheduling
+  `requestRestart()` via `#schedulePostPromptTask` (`agent-session.ts:4328-4353`)
+  does not fix it: that scheduler always registers the task in `#postPromptTasks`
+  (`#trackPostPromptTask`, `agent-session.ts:4352` → `:4316`). `requestRestart()`
+  then waits on a set that contains itself, two ways: (i) its own step-3
+  `waitForIdle()` → `#waitForPostPromptRecovery()` awaits `#postPromptTasksPromise`
+  (`agent-session.ts:4470-4471`), which resolves only when `#postPromptTasks`
+  empties (`:4322-4323`); (ii) the `dispose()` in step 6 awaits
+  `#cancelPostPromptTasks()` → `Promise.allSettled(pendingTasks)`
+  (`:4438`/`:4444`). Either way the scheduled restart task is *in* the set being
+  awaited → self-deadlock. `#schedulePostPromptTask`'s `AbortSignal` (`:4333`)
+  does not rescue it: the task is synchronously deep in `waitForIdle`/`dispose`,
+  not parked at an abort checkpoint.
+- *Untracked post-drain hook (the contract).* `execute()` returns immediately
+  with an acknowledgement, then fires `requestRestart()` from a continuation that
+  runs *after* the post-prompt phase has fully drained and is **not** registered
+  in `#postPromptTasks` (a raw `queueMicrotask`/`setTimeout` on the turn-idle
+  transition, never through `#schedulePostPromptTask`). Because it runs once the
+  tracked set is already empty, nothing it awaits includes itself. The same
+  continuation carries the resolved `RequestRestartResult` back to the transcript
+  as a system notice (a later `{ ok: false, reason: "busy" }`, an abort, or a
+  throwing host callback must be model-visible — the `execute()` ack only means
+  "scheduled", not "restarted"). `RefreshTool` is NOT a valid template —
+  `session.refresh()` (`sdk.ts:1631`) never waits for turn idle, so it can be
+  awaited inline; restart cannot.
 
 Interfaces:
 
@@ -563,8 +641,10 @@ export class RestartTool
 {
     readonly name = "restart";
     readonly approval = "exec" as const;
-    // execute(): guard the binding, record an acknowledgement result, then
-    // schedule requestRestart() as a post-prompt task (NOT an inline await).
+    // execute(): guard the binding, return an acknowledgement result, then fire
+    // requestRestart() from an UNTRACKED post-drain continuation (never through
+    // #schedulePostPromptTask) and report its RequestRestartResult back to the
+    // transcript.
 }
 
 // tools/index.ts — ToolSession (next to refresh, index.ts:390)
@@ -577,7 +657,14 @@ Test cycle (Tester agent, red → green):
   binding or the callback is unbound;
 - does NOT deadlock: the tool call returns while a turn is in flight, and
   `requestRestart()` runs after the turn settles (assert the host callback
-  fires post-turn, not during `execute()`);
+  fires post-turn, not during `execute()`). Regression guard for the tracked-task
+  trap: the scheduled restart must complete — a version that enqueues it into
+  `#postPromptTasks` hangs here (self-inclusion in the drained set), so the test
+  fails closed if an executor reaches for `#schedulePostPromptTask`;
+- reports the real outcome: when `requestRestart()` resolves
+  `{ ok: false, reason: "busy" }` (input queued after the ack) or the host
+  callback throws, the failure is surfaced to the transcript, not swallowed
+  behind the `execute()` success ack;
 - requires exec approval (mirror `refresh-tool.test.ts`'s
   `requiresApproval` coverage).
 
@@ -586,12 +673,13 @@ Test cycle (Tester agent, red → green):
 - [ ] Task 1 — `onRestartRequested` option + `AgentSession.requestRestart()`
       (re-entrancy + busy guards, latch, capture, durability barrier, dispose,
       awaited callback; tests)
-- [ ] Task 2 — `onBeforeRefresh` option threaded at the top of
-      `AgentSession.refresh()` (awaited, propagate-on-throw, no-op unset; tests)
+- [ ] Task 2 — `onBeforeRefresh` option + refresh mutex, threaded into
+      `AgentSession.refresh()` (serialized critical section, awaited hook,
+      propagate-on-throw + lock-release, no-op unset; tests)
 - [ ] Task 3 — SDK wiring through `createAgentSession` + host-recipe docs
       (integration tests)
-- [ ] Task 4 — model-callable `restart` tool (`approval: "exec"`, post-turn
-      scheduling, unbound guard; tests)
+- [ ] Task 4 — model-callable `restart` tool (`approval: "exec"`, untracked
+      post-drain scheduling + result reporting, unbound guard; tests)
 
 ## Resolved decisions
 
@@ -604,10 +692,11 @@ The model can invoke restart via a `restart` tool (Task 4), alongside
 host-driven `session.requestRestart()`. `approval: "exec"` (auto-runs only in
 yolo mode; always prompts in always-ask / write), guarded on the callback being
 bound, mirroring how `refresh` guards on `session.refresh`
-(`tools/refresh.ts:78`). The tool schedules `requestRestart()` post-turn (never
-an inline await — see Task 4's deadlock note), so a model-triggered restart
-recycles the session cleanly after the turn that requested it records its
-result.
+(`tools/refresh.ts:78`). The tool returns an acknowledgement, then fires
+`requestRestart()` from an untracked post-drain continuation (never an inline
+await, and never a tracked `#postPromptTask` — both deadlock; see Task 4), and
+reports the resolved `RequestRestartResult` back to the transcript so a later
+`busy`/abort/callback-throw is model-visible rather than hidden behind the ack.
 
 ### (b) Teardown ordering — OMP disposes before the callback
 
@@ -623,6 +712,25 @@ callback; blue/green is not actually reachable given those constraints.
 `dispose()` is idempotent (`agent-session.ts:5861-5865`), so a host that also
 calls it is harmless.
 
+### (g) Refresh concurrency — serialize with an in-session mutex
+
+`refresh()` has no mutex today; the `onBeforeRefresh` pre-hook stretches the
+critical section from a millisecond re-scan to a seconds-scale network pull, so
+two overlapping refreshes (host-driven + `/refresh`, or two host calls) could
+interleave the separate `setActiveSkills`/`setActiveRules`/settings/MCP swaps and
+leave the process publishing config from two different pulls. Chosen: close it in
+this contract with a session-level mutex over the whole operation (hook + rescans
++ swaps), mechanized as a `#refreshTail` promise chain — the serializing sibling
+of the coalescing `#disposeCall`/`#restartCall` guard
+(`agent-session.ts:5861-5865`); coalescing dedupes to one result, but two refreshes
+of different scopes must both run in order, so the tail chains rather than shares.
+Rejected: leaving it documented as a known non-guarantee. The race pre-exists the
+hook, but the hook makes it deployment-real for the always-on multi-tenant target
+this record serves, and a design record that adds the widening hook should not
+ship the widened race unclosed. `RefreshTool`'s `concurrency: "exclusive"`
+(`tools/refresh.ts:67`) is not sufficient — it only serializes within one agent's
+tool batch, not against host-driven or `/refresh` calls.
+
 ### (e) Restart latch — `requestRestart()` latches, not just waits
 
 `waitForIdle()` (`agent-session.ts:6086-6089`) is a *wait*, not a *latch*: after
@@ -632,8 +740,9 @@ it resolves, an IRC wake (`#promptIrcRecords`, fire-and-forget
 a host `prompt()` could start a new turn and append past the durability barrier;
 it also misses in-flight starts that `isStreaming` counts via
 `#promptInFlightCount` (`agent-session.ts:6077-6078`) but `waitForIdle` does
-not, and in-memory steering/follow-up queues (`agent.hasQueuedMessages()`,
-`sdk.ts:2208`) are never persisted. So `requestRestart()` sets a `#restarting`
+not, and in-memory steering/follow-up queues (`agent.hasQueuedMessages()`, the
+raw `#steeringQueue`/`#followUpQueue` predicate at `packages/agent/src/agent.ts:888-890`,
+not the displayable-filtered `sdk.ts:2208` field) are never persisted. So `requestRestart()` sets a `#restarting`
 latch before the wait (refusing new turns and pausing async-job delivery through
 the callback) and refuses with `{ ok: false, reason: "busy" }` when input is
 queued at entry. This makes the durability promise true for the always-on agents
