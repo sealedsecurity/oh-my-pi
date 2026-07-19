@@ -159,9 +159,12 @@ type RequestRestartResult =
 
    so the file the host re-opens reflects the full transcript.
 
-6. **Drain the refresh mutex, then dispose, then invoke.** First
-   `await this.#refreshTail` so any `refresh()` already inside its critical
-   section (a seconds-scale `onBeforeRefresh` pull) completes. Its
+6. **Drain the refresh mutex, then dispose, then invoke.** First drain any
+   `refresh()` already inside its critical section (a seconds-scale
+   `onBeforeRefresh` pull) — awaiting its *actual* settlement, tracked
+   separately from the failure-swallowing `#refreshTail` tail
+   (`run.then(() => {}, () => {})`, Task 2) which resolves even when the refresh
+   threw. Its
    `setActiveSkills`/`setActiveRules` swaps (`reload.ts:112`/`:122`) mutate
    in-memory process globals — they are *not* persisted, and the replacement
    re-scans disk and re-swaps the globals itself at construction
@@ -173,7 +176,12 @@ type RequestRestartResult =
    session) completes while only the old session is registered, so it cannot
    clobber the replacement's freshly-scanned `#skills` once the host creates and
    registers it. The `#restarting` latch (set in step 3) already refuses *new*
-   refreshes, so nothing chains on behind the drained one. Then
+   refreshes, so nothing chains on behind the drained one. If the drained
+   refresh *failed* its `onBeforeRefresh` pull (a partial disk write, then a
+   throw), the drain surfaces that failure — the restart aborts *recoverably*
+   (decision (h)) instead of disposing over torn config — and the host staging
+   contract also requires atomic writes (temp-file + rename, decision (j)) so a
+   thrown pull leaves the scanned paths untouched regardless. Then
    `await this.dispose()` (idempotent, single shared
    `#disposeCall` promise, `agent-session.ts:5861-5865`), then
    `await this.#onRestartRequested({ sessionId, sessionFile })`. OMP disposes
@@ -186,7 +194,8 @@ type RequestRestartResult =
 7. Return `{ ok: true }` once the callback resolves. Failures split on whether
    `dispose()` (step 6) has begun — detected by `#disposeCall` being set. A
    **pre-dispose failure** (`waitForIdle()`, the `flush()`/`ensureOnDisk()`
-   barrier, or the `#refreshTail` drain throwing before dispose) is *recoverable*:
+   barrier, or the `#refreshTail` drain — either the drain itself throwing or a
+   drained refresh reporting a failed pull — before dispose) is *recoverable*:
    the session is still alive, so `requestRestart()` drops the `#restarting` latch
    and clears `#restartCall` before rethrowing, and the host may retry a fresh
    restart (decision (h)). A **post-dispose failure** — the host callback throwing
@@ -215,11 +224,17 @@ same guard the unbound path uses), refuses to *start* a new `refresh()` (the
 lock acquirer early-returns `{ refused: "restarting" }` while `#restarting`, so
 no roster re-scan chains on behind the one restart drains in step 6 — an
 in-flight refresh is drained, a new one is turned away with an explicit refusal
-rather than a silent no-op), and async-job delivery is paused: while
-`#restarting`, `onJobComplete` (`sdk.ts:1509-1522`) short-circuits before
-`session.yieldQueue.enqueue` (`sdk.ts:1515`), the same early-return shape as the
-existing `isDeliverySuppressed(jobId)` gate (`sdk.ts:1510-1512`), so a job that
-finishes mid-recycle holds its delivery instead of waking a new turn. Parked
+rather than a silent no-op). Async-job delivery is *not* paused: an
+`onJobComplete` completion (`sdk.ts:1509-1522`) enqueues to `yieldQueue`
+(`sdk.ts:1515`) normally, but cannot *wake* a turn past the barrier because the
+`#restarting` latch gates turn *start* — including idle-injection (`injectIdle`,
+`agent-session.ts:2270-2274`), the sole path that turns a queued result into a
+turn. That closure calls the *raw* `this.agent.prompt`, bypassing
+`AgentSession.prompt`'s guard, so it takes its own `#restarting` check (decision
+(i)). A successful restart clears the queue in `dispose()` (`yieldQueue.clear()`,
+`agent-session.ts:5844`); a *recoverable* pre-dispose failure (decision (h))
+leaves the completion queued for the resumed session to drain, so none is lost
+(decision (i)). Parked
 in-memory input is not silently dropped: if `agent.hasQueuedMessages()`
 (`packages/agent/src/agent.ts:888`) is true at entry, `requestRestart()` returns
 `{ ok: false, reason: "busy" }` rather than recycling over queued steering /
@@ -308,8 +323,11 @@ extension discovery). See Resolved decision (d).
  * surface is re-read. Gives an embedded host the chance to pull fresh
  * skills/rules/settings/MCP config and WRITE it to the disk paths the
  * session scans; the refresh then re-reads from disk as usual. Receives
- * the scope so the host pulls only what is being refreshed. Unset => no-op
- * (existing behavior unchanged). A rejection aborts the refresh.
+ * the scope so the host pulls only what is being refreshed. Writes MUST be
+ * atomic (stage to a temp path, then rename) so a mid-pull throw leaves the
+ * scanned paths untouched — a concurrent restart drains this refresh and a
+ * torn write would otherwise be scanned by the replacement (decision (j)).
+ * Unset => no-op (existing behavior unchanged). A rejection aborts the refresh.
  */
 onBeforeRefresh?: (scope: RefreshScope) => void | Promise<void>;
 ```
@@ -385,14 +403,20 @@ any surface is swapped, so a hook throw releases the mutex with all
 roster/settings/MCP state untouched and no half-applied interleave visible to the
 next waiter.
 
-The same mutex is what `requestRestart()` drains: the restart latch refuses a
-*new* refresh (the acquirer early-returns `{ refused: "restarting" }` while
-`#restarting`), and restart
-`await`s `#refreshTail` before dispose so an in-flight refresh's
-`applyReloadedSkills` fan-out and `onBeforeRefresh` disk writes complete while
-only the old session is registered — they cannot clobber the freshly-scanned
+The same mutex is what `requestRestart()` drains before dispose, so an in-flight
+refresh's `applyReloadedSkills` fan-out and `onBeforeRefresh` disk writes complete
+while only the old session is registered — they cannot clobber the freshly-scanned
 `#skills`/on-disk config the replacement re-reads for itself (Task 1 step 6,
-decision (e)).
+decision (e)). Two subtleties: (1) the restart latch refuses a *new* refresh (the
+acquirer early-returns `{ refused: "restarting" }` while `#restarting`), so only
+the one already in its critical section drains. (2) Restart drains the refresh's
+*actual* settlement — a handle to the running `#doRefresh` promise, **not** the
+`#refreshTail` tail, which is deliberately failure-swallowing
+(`run.then(() => {}, () => {})`) so overlapping callers never reject each other.
+Awaiting the sanitized tail would let a refresh whose `onBeforeRefresh` pull threw
+mid-write resolve *clean*, and restart would dispose over torn config. Observing
+the real settlement instead lets a drained-refresh failure abort the restart
+recoverably (decisions (h), (j)).
 
 **Companion `onAfterRefresh` — not included.** A
 `(scope, result: RefreshResult) => void | Promise<void>` companion would give
@@ -492,10 +516,16 @@ Implement `requestRestart()` on `AgentSession` with the sequence from the
 Approach: return the in-flight `#restartCall` if one exists → unbound guard →
 no-session-file guard → busy guard (`hasQueuedMessages()`) — these return
 `{ ok: false }` without latching or caching → set `#restarting` latch (refuse new
-turns *and* new refreshes, pause async-job delivery) and cache the committed
+turns *and* new refreshes; async-job completions still enqueue, but the
+turn-start gate — a `#restarting` early-return added inside the `injectIdle`
+closure (`agent-session.ts:2270`), since it calls the raw agent and skips
+`AgentSession.prompt`'s guard — keeps a queued result from waking a turn —
+decision (i)) and cache the committed
 attempt on `#restartCall` → `waitForIdle()` → capture durable `getSessionId()` +
-`sessionFile` → `flush()` + `ensureOnDisk()` → `await #refreshTail` (drain
-in-flight refresh; Task 2's mutex) → `dispose()` → `await` callback → `{ ok: true }`.
+`sessionFile` → `flush()` + `ensureOnDisk()` → drain the in-flight refresh's
+*real* settlement (Task 2's mutex; the running `#doRefresh` handle, not the
+failure-swallowing `#refreshTail` tail, so a failed pull surfaces — decision (j))
+→ `dispose()` → `await` callback → `{ ok: true }`.
 Wrap the latch-and-fallible-ops region: a throw before `dispose()` begins (detected
 via `#disposeCall` unset) clears `#restarting` and `#restartCall` then rethrows, so
 the session resumes and the host can retry; a throw at or after `dispose()` stays
@@ -565,6 +595,19 @@ Test cycle (Tester agent, red → green):
   is no longer refused), `#restartCall` is cleared, and a second `requestRestart()`
   runs the full sequence to `{ ok: true }`; separately, a callback throw *after*
   dispose leaves the session terminal (no unlatch, a retry does not re-dispose).
+- async completion during restart is not dropped (decision (i)): with
+  `#restarting` set, drive an `onJobComplete` (`sdk.ts:1509-1522`) to fire and
+  assert (a) it enqueues to `yieldQueue` (`sdk.ts:1515`) rather than
+  short-circuiting, (b) no new turn starts while latched (idle-injection is
+  gated), and (c) on a *recoverable* pre-dispose failure the entry is still
+  queued for the resumed session to drain (nothing lost); on a *successful*
+  restart `dispose()`'s `yieldQueue.clear()` (`agent-session.ts:5844`) drops it.
+- drained refresh failure aborts restart recoverably (decision (j)): with an
+  `onBeforeRefresh` that partial-writes then throws, start `refresh()`, then a
+  concurrent `requestRestart()`; assert restart observes the refresh's real
+  settlement (not the swallowed `#refreshTail`), does NOT dispose, unlatches, and
+  rethrows — a second `requestRestart()` after the host re-stages runs to
+  `{ ok: true }`.
 
 ### Task 2 — `onBeforeRefresh` option + refresh mutex, threaded into `refresh()`
 
@@ -575,7 +618,10 @@ make the awaited `onBeforeRefresh` call the first statement of `#doRefresh`,
 before the `doRoster`/`doSettings`/`doMcp` scope flags are computed
 (`agent-session.ts:6912-6915` today). The mutex spans the hook, every re-scan,
 and every surface swap, so overlapping refreshes cannot interleave (see
-Approach → Concurrency).
+Approach → Concurrency). The acquirer also exposes a handle to the in-flight
+`#doRefresh` run (`#activeRefresh`) so `requestRestart()` can drain the refresh's
+*real* settlement — the `#refreshTail` tail is failure-swallowing and would hide
+a failed pull from the restart (decision (j)).
 
 Interfaces:
 
@@ -586,8 +632,12 @@ onBeforeRefresh?: (scope: RefreshScope) => void | Promise<void>;
 // agent-session.ts — AgentSessionConfig
 onBeforeRefresh?: (scope: RefreshScope) => void | Promise<void>;
 
-// agent-session.ts — AgentSession private mutex tail
+// agent-session.ts — AgentSession private mutex tail + in-flight handle.
+// The tail serializes callers and never rejects (isolates overlapping refreshers);
+// #activeRefresh is the raw in-flight run requestRestart() drains so a failed
+// onBeforeRefresh pull surfaces to the restart, not just to the refresh caller.
 #refreshTail: Promise<unknown> = Promise.resolve();
+#activeRefresh: Promise<RefreshResult> | undefined;
 
 // extensibility/reload.ts — RefreshResult gains a refusal marker so a refresh
 // refused while #restarting is distinguishable from a successful no-op
@@ -640,6 +690,13 @@ Test cycle (Tester agent, red → green):
   `{ refused: "restarting" }` result returns "Refresh skipped (<scope>): restart
   in progress." (assert the exact string, and that `RefreshTool.execute` /
   `/refresh` surface it — not the empty-`RefreshResult` no-op summary).
+- drain handle surfaces failure (decision (j)): a refresh whose `onBeforeRefresh`
+  rejects settles `#activeRefresh` as a rejection (assert the raw handle rejects)
+  even though `#refreshTail` resolves — so `requestRestart()` draining
+  `#activeRefresh` observes the failure. (The Task 1 matrix asserts the restart's
+  recoverable-abort response; this asserts the handle the restart reads. The
+  atomic-write requirement is a host-side contract carried by the option
+  doc-comment, not OMP-testable here.)
 
 ### Task 3 — SDK wiring + docs
 
@@ -777,15 +834,20 @@ Test cycle (Tester agent, red → green):
 ## Tasks
 
 - [ ] Task 1 — `onRestartRequested` option + `AgentSession.requestRestart()`
-      (re-entrancy + busy guards, latch that also refuses new refreshes, capture,
-      durability barrier, drain `#refreshTail` before dispose, dispose, awaited
-      callback, pre-dispose failure unlatches while post-dispose stays terminal
-      (decision (h)); tests) — the drain/refuse depends on Task 2's `#refreshTail`
+      (re-entrancy + busy guards, latch that also refuses new refreshes and gates
+      turn-start so paused async completions enqueue without waking a turn
+      (decision (i)), capture, durability barrier, drain the in-flight refresh's
+      *real* settlement — `#activeRefresh`, not the swallowed `#refreshTail`, so a
+      failed pull aborts recoverably (decision (j)) — before dispose, dispose,
+      awaited callback, pre-dispose failure unlatches while post-dispose stays
+      terminal (decision (h)); tests) — the drain/refuse depends on Task 2's mutex
 - [ ] Task 2 — `onBeforeRefresh` option + refresh mutex, threaded into
       `AgentSession.refresh()` (serialized critical section, awaited hook,
       propagate-on-throw + lock-release, no-op unset, acquirer early-returns
       `{ refused: "restarting" }` while `#restarting`, `summarizeRefresh` renders
-      that marker so `RefreshTool`/`/refresh` report the refusal; tests)
+      that marker so `RefreshTool`/`/refresh` report the refusal, exposes
+      `#activeRefresh` for the restart drain, atomic-write host contract in the
+      option doc-comment (decision (j)); tests)
 - [ ] Task 3 — SDK wiring through `createAgentSession` + host-recipe docs
       (integration tests)
 - [ ] Task 4 — model-callable `restart` tool (`approval: "exec"`, untracked
@@ -868,12 +930,14 @@ not, and in-memory steering/follow-up queues (`agent.hasQueuedMessages()`, the
 raw `#steeringQueue`/`#followUpQueue` predicate at `packages/agent/src/agent.ts:888-890`,
 not the displayable-filtered `sdk.ts:2208` field) are never persisted. So `requestRestart()` sets a `#restarting`
 latch before the wait (refusing new turns, refusing to *start* a new `refresh()`,
-and pausing async-job delivery through the callback) and refuses with
+and async-job completions still enqueue, but the turn-start gate stops a queued
+result from waking a turn — decision (i)) and refuses with
 `{ ok: false, reason: "busy" }` when input is queued at entry. Because the latch
-turns away only *new* refreshes, restart also `await`s `#refreshTail` before
-dispose (Task 1 step 6) to drain a refresh already in its critical section — its
-in-memory `applyReloadedSkills` fan-out and `onBeforeRefresh` disk writes must
-complete while only the old session is registered, so they cannot clobber the
+turns away only *new* refreshes, restart also drains a refresh already in its
+critical section before dispose (Task 1 step 6) — awaiting its *actual*
+settlement, not the failure-swallowing `#refreshTail` tail (decision (j)) — so
+its in-memory `applyReloadedSkills` fan-out and `onBeforeRefresh` disk writes
+complete while only the old session is registered and cannot clobber the
 `#skills`/config the replacement re-scans for itself (decision (g)). This makes the durability promise true for the always-on agents
 Compass drives (Dispatcher / Warden, `compass.md` §4.2/§4.3), which cannot
 guarantee external idleness. Rejected: snapshot + documented "call only when
@@ -889,7 +953,9 @@ modes are not symmetric. `dispose()` is one-way, so caching its settled promise
 forever — resolved or rejected — is correct. `requestRestart()` sets the
 `#restarting` latch (step 3) and then runs fallible work while the session is
 *still alive*: `waitForIdle()`, the `flush()`/`ensureOnDisk()` durability barrier
-(step 5), and the `#refreshTail` drain (step 6, before `dispose()`). If any of
+(step 5), the `#refreshTail` drain (step 6, before `dispose()`), and — since the
+drain now observes the drained refresh's real settlement (decision (j)) — a
+drained refresh reporting a failed pull. If any of
 these throws, a naive shared-promise cache strands the session — `#restarting`
 stays set (new turns reject, `refresh()` returns `{ refused: "restarting" }`) and
 `#restartCall` holds the rejection, so every later `requestRestart()` replays the
@@ -930,6 +996,64 @@ live always-on agent until manual intervention, against the
 durability-for-always-on goal; terminal-bricking behind a documented
 non-guarantee is worse still. Surfaced as Greptile P1 on the round-7 review;
 Matt's call.
+
+### (i) Paused-restart async completions enqueue and gate on turn-start, not delivery
+
+While `#restarting`, a background job that finishes must not wake a turn that
+appends past the durability barrier (step 5). An earlier draft short-circuited
+`onJobComplete` (`sdk.ts:1509-1522`) before `session.yieldQueue.enqueue`
+(`sdk.ts:1515`) — but the delivery loop `shift()`s a delivery off `#deliveries`
+*before* invoking the callback (`async/job-manager.ts:650`) and only re-queues on
+a *throw* (`:664-665`); a clean early-return counts as delivered, so the result is
+**dropped**, not held. Harmless on a *successful* restart (dispose tears down the
+owned `AsyncJobManager` at `agent-session.ts:5903` and clears the queue at
+`:5844`; nothing survives the recycle) — but on a *recoverable* pre-dispose
+failure (decision (h)) the session resumes alive having silently lost a completed
+job's result, a durability hole in exactly the always-on target this record
+serves.
+
+Chosen: **do not intercept delivery.** `onJobComplete` enqueues to `yieldQueue`
+normally; the `#restarting` latch already gates turn *start*, which is the only
+thing that must be suppressed. The sole path that turns a queued async result into
+a new turn is idle-injection (`injectIdle`, `agent-session.ts:2270-2274`).
+Critically, that closure calls `this.agent.prompt` — the **raw agent**
+(`agent-session.ts:2273`), *not* `AgentSession.prompt` — so it does **not** inherit
+the `#restarting`/`AgentBusyError` guard on `AgentSession.prompt`
+(`agent-session.ts:7870`, `:7918-7919`); the latch check must be added inside the
+`injectIdle` closure itself (a `#restarting` early-return before
+`this.agent.prompt`). Mid-run asides (`setAsideMessageProvider`,
+`agent-session.ts:2289`) inject only into an already-running turn at a step
+boundary, and step 3's `waitForIdle` guarantees no turn is streaming across the
+restart window, so once `injectIdle` is gated it is the only reachable waker. On a
+successful restart `dispose()`'s `yieldQueue.clear()` drops the queued
+entry (correct — the replacement re-derives job state); on a recoverable failure it
+stays queued for the resumed session to drain. Rejected: the store-and-replay
+buffer (extra cross-boundary state for a rare error path) and accepting the drop
+(the silent durability hole above). Surfaced as Greptile P1 on the round-9 review;
+Matt's call.
+
+### (j) Drained refresh failure is observable; `onBeforeRefresh` writes are atomic
+
+`requestRestart()` drains an in-flight `refresh()` before dispose (step 6). The
+serializing mutex tail is `#refreshTail = #refreshTail.then(runThisRefresh)` with
+the stored tail deliberately failure-swallowing (`run.then(() => {}, () => {})`,
+decision (g)) so overlapping refresh callers never reject each other. If restart
+awaited *that* tail, a refresh whose `onBeforeRefresh` pull partially wrote config
+then threw would resolve the drain **clean**: restart disposes and the replacement
+scans torn config — the refresh caller sees the error, restart never does.
+
+Chosen: **both** guards. (1) Restart drains the refresh's *actual* settlement — a
+handle to the running `#doRefresh(scope)` promise held alongside the sanitized tail
+— so a drained-refresh failure surfaces and restart treats it as a *recoverable*
+pre-dispose failure (decision (h)): unlatch, rethrow, host may retry. (2) The
+`onBeforeRefresh` host-staging contract requires **atomic** writes (stage to a
+temp path, then rename) so a mid-pull throw leaves the scanned paths untouched
+regardless — the primary guarantee; observing the failure is the belt-and-suspenders
+that keeps restart from disposing over a refresh it can no longer trust. Rejected:
+atomicity alone (leaves the drain blind to a non-write failure mid-refresh) and
+drain-observation alone (a non-atomic host could still tear config a *non-restart*
+refresh caller then scans). Surfaced as Greptile P1 on the round-9 review; Matt's
+call.
 
 ### Refresh callback shape: disk pre-hook, not an in-memory provider
 
