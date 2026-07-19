@@ -374,8 +374,9 @@ deployment-real for the always-on multi-tenant target, this record closes it:
 `onBeforeRefresh` hook, every disk re-scan, and every surface swap — so
 concurrent callers run strictly one-at-a-time and each sees a fully-applied prior
 refresh. The mechanism is a private promise-tail chain (`#refreshTail =
-#refreshTail.then(runThisRefresh)`), the *serializing* sibling of the
-*coalescing* `#disposeCall`/`#restartCall` guard (`agent-session.ts:5861-5865`):
+#refreshTail.then(runThisRefresh)`), the *serializing* sibling of
+`#disposeCall`'s *coalescing* guard (`agent-session.ts:5861-5865`), whose
+`#restartCall` analogue this record adds:
 coalescing dedupes to one shared result, but two refreshes of different scopes
 must both run, in order, so the tail chains rather than shares. Each caller still
 gets its own `RefreshResult`. The abort guarantee is unaffected and now
@@ -833,8 +834,8 @@ interleave the separate `setActiveSkills`/`setActiveRules`/settings/MCP swaps an
 leave the process publishing config from two different pulls. Chosen: close it in
 this contract with a session-level mutex over the whole operation (hook + rescans
 + swaps), mechanized as a `#refreshTail` promise chain — the serializing sibling
-of the coalescing `#disposeCall`/`#restartCall` guard
-(`agent-session.ts:5861-5865`); coalescing dedupes to one result, but two refreshes
+of `#disposeCall`'s coalescing guard (`agent-session.ts:5861-5865`), whose
+`#restartCall` analogue this record adds; coalescing dedupes to one result, but two refreshes
 of different scopes must both run in order, so the tail chains rather than shares.
 Rejected: leaving it documented as a known non-guarantee. The race pre-exists the
 hook, but the hook makes it deployment-real for the always-on multi-tenant target
@@ -899,15 +900,21 @@ serves.
 Chosen: a pre-dispose failure is *recoverable*. The latch-and-fallible-ops region
 is wrapped; on a throw with `#disposeCall` still unset (dispose has not begun) it
 clears both `#restarting` and `#restartCall`, then rethrows. The session resumes
-normal turns and refreshes, and the host — which received the rejection — may call
-`requestRestart()` again. Only a failure at or after `dispose()` stays terminal:
+normal turns and refreshes immediately; recovery does not depend on a retry. A
+caller that observes the rejection (the direct-await path of step 7, not the model
+tool's catch-and-log) may then call `requestRestart()` again. Only a failure at or
+after `dispose()` stays terminal:
 the callback throw of step 7, the old session already gone, with nothing to
 unlatch and no retry that may re-dispose.
 
 ```ts
+// requestRestart(), synchronous prefix:
 this.#restarting = true;                          // latch (step 3), before any await
 this.#restartCall = this.#doRequestRestart();     // coalesce the committed attempt
-// inside #doRequestRestart, wrapping waitForIdle → barrier → drain → dispose → callback:
+
+// inside #doRequestRestart (async): waitForIdle → barrier → drain → dispose → callback
+try {
+    /* ...the fallible restart work... */
 } catch (err) {
     if (!this.#disposeCall) {           // threw before dispose began — recoverable
         this.#restarting = false;
