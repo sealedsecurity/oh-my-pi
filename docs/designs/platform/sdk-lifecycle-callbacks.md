@@ -213,7 +213,7 @@ fails in its pre-dispose window is recoverable and must *not* be cached — see
 decision (h).
 
 **Latch semantics.** `waitForIdle()` (`agent-session.ts:6086-6089`) is a
-*wait*, not a *latch* — after it resolves, an IRC wake (`#promptIrcRecords`,
+*wait*, not a *latch* — after it resolves, an IRC wake (`#wakeForIrc`,
 fire-and-forget `void this.agent.prompt`), an async-job completion enqueued to
 `yieldQueue` (`sdk.ts:1509-1522`), a queued-message drain
 (`agent-session.ts:8478-8495`), or a host `prompt()` could start a new turn and
@@ -227,11 +227,14 @@ in-flight refresh is drained, a new one is turned away with an explicit refusal
 rather than a silent no-op). Async-job delivery is *not* paused: an
 `onJobComplete` completion (`sdk.ts:1509-1522`) enqueues to `yieldQueue`
 (`sdk.ts:1515`) normally, but cannot *wake* a turn past the barrier because the
-`#restarting` latch gates turn *start* — including idle-injection (`injectIdle`,
-`agent-session.ts:2270-2274`), the sole path that turns a queued result into a
-turn. That closure calls the *raw* `this.agent.prompt`, bypassing
-`AgentSession.prompt`'s guard, so it takes its own `#restarting` check (decision
-(i)). A successful restart clears the queue in `dispose()` (`yieldQueue.clear()`,
+`#restarting` latch gates turn *start*. Two closures start a turn through the
+*raw* `this.agent.prompt`, bypassing `AgentSession.prompt`'s guard, so each takes
+its own `#restarting` check (decision (i)): idle-injection (`injectIdle`,
+`agent-session.ts:2270-2274`) turns a queued async result into a turn, and the
+IRC wake (`#wakeForIrc`, `agent-session.ts:2098`) — reached from stranded-aside
+resume (`agent-session.ts:2074`) and idle IRC delivery
+(`agent-session.ts:14980`) — turns an incoming peer message into one. A
+successful restart clears the queue in `dispose()` (`yieldQueue.clear()`,
 `agent-session.ts:5844`); a *recoverable* pre-dispose failure (decision (h))
 leaves the completion queued for the resumed session to drain, so none is lost
 (decision (i)). Parked
@@ -527,13 +530,18 @@ Approach: return the in-flight `#restartCall` if one exists → unbound guard �
 no-session-file guard → busy guard (`hasQueuedMessages()`) — these return
 `{ ok: false }` without latching or caching → set `#restarting` latch (refuse new
 turns *and* new refreshes; async-job completions still enqueue, but the
-turn-start gate — a `#restarting` early-return added inside the `injectIdle`
-closure (`agent-session.ts:2270`), since it calls the raw agent and skips
-`AgentSession.prompt`'s guard; the same guard also short-circuits on
-`#isDisposed` so a post-dispose async completion cannot re-wake a torn-down
-session even if dispose's internal ordering later changes (defense-in-depth —
-dispose already clears `yieldQueue` before draining jobs) — keeps a queued
-result from waking a turn —
+turn-start gate — a `#restarting` early-return added inside both raw-agent
+closures that skip `AgentSession.prompt`'s guard: `injectIdle`
+(`agent-session.ts:2270`) for async results, and `#wakeForIrc`
+(`agent-session.ts:2098`, the shared choke point for stranded-aside resume and
+idle IRC delivery) for IRC wakes, which preserves the refused records in the
+pending IRC queues (`#pendingIrcInterrupts`/`#pendingIrcAsides`) so nothing is
+lost — flushed to transcript by `#flushPendingIrcAsides()` on dispose, or left
+pending for the resumed session on a recoverable failure; the same `#restarting`
+guard also short-circuits on `#isDisposed` so a post-dispose completion cannot
+re-wake a torn-down session even if dispose's internal ordering later changes
+(defense-in-depth — dispose already clears `yieldQueue` before draining jobs) —
+keeps a queued result or IRC wake from starting a turn —
 decision (i)) and cache the committed
 attempt on `#restartCall` → `waitForIdle()` → capture durable `getSessionId()` +
 `sessionFile` → `flush()` + `ensureOnDisk()` → drain the in-flight refresh's
@@ -616,6 +624,12 @@ Test cycle (Tester agent, red → green):
   gated), and (c) on a *recoverable* pre-dispose failure the entry is still
   queued for the resumed session to drain (nothing lost); on a *successful*
   restart `dispose()`'s `yieldQueue.clear()` (`agent-session.ts:5844`) drops it.
+- IRC wake during restart is refused, not lost (decision (i)): with `#restarting`
+  set, deliver an IRC message (`deliverIrcMessage`, idle path) and assert (a) no
+  new turn starts (the `#wakeForIrc` gate holds), and (b) the record is preserved
+  in the pending IRC queues — flushed to transcript on a successful restart's
+  dispose (`#flushPendingIrcAsides()`), or left pending for the resumed session on
+  a recoverable pre-dispose failure (nothing lost).
 - drained refresh failure aborts restart recoverably (decision (j)): with an
   `onBeforeRefresh` that partial-writes then throws, start `refresh()`, then a
   concurrent `requestRestart()`; assert restart observes the refresh's real
@@ -869,8 +883,9 @@ Test cycle (Tester agent, red → green):
 
 - [ ] Task 1 — `onRestartRequested` option + `AgentSession.requestRestart()`
       (re-entrancy + busy guards, latch that also refuses new refreshes and gates
-      turn-start so paused async completions enqueue without waking a turn
-      (decision (i)), capture, durability barrier, drain the in-flight refresh's
+      turn-start so paused async completions and IRC wakes enqueue/preserve
+      without waking a turn (decision (i)), capture, durability barrier, drain
+      the in-flight refresh's
       *real* settlement — `#activeRefresh`, not the swallowed `#refreshTail`, so a
       failed pull aborts recoverably (decision (j)) — before dispose, dispose,
       awaited callback, pre-dispose failure unlatches while post-dispose stays
@@ -956,7 +971,7 @@ anti-silent-lie stance as the hook-throw error semantics above.
 ### (e) Restart latch — `requestRestart()` latches, not just waits
 
 `waitForIdle()` (`agent-session.ts:6086-6089`) is a *wait*, not a *latch*: after
-it resolves, an IRC wake (`#promptIrcRecords`, fire-and-forget
+it resolves, an IRC wake (`#wakeForIrc`, fire-and-forget
 `void this.agent.prompt`), an async-job completion enqueued to `yieldQueue`
 (`sdk.ts:1509-1522`), a queued-message drain (`agent-session.ts:8478-8495`), or
 a host `prompt()` could start a new turn and append past the durability barrier;
@@ -966,8 +981,9 @@ not, and in-memory steering/follow-up queues (`agent.hasQueuedMessages()`, the
 raw `#steeringQueue`/`#followUpQueue` predicate at `packages/agent/src/agent.ts:888-890`,
 not the displayable-filtered `sdk.ts:2208` field) are never persisted. So `requestRestart()` sets a `#restarting`
 latch before the wait (refusing new turns, refusing to *start* a new `refresh()`,
-and async-job completions still enqueue, but the turn-start gate stops a queued
-result from waking a turn — decision (i)) and refuses with
+and async-job completions plus IRC wakes still enqueue/preserve, but the
+turn-start gate on both raw-`this.agent.prompt` closures stops a queued
+result or peer message from waking a turn — decision (i)) and refuses with
 `{ ok: false, reason: "busy" }` when input is queued at entry. Because the latch
 turns away only *new* refreshes, restart also drains a refresh already in its
 critical section before dispose (Task 1 step 6) — awaiting its *actual*
@@ -1033,7 +1049,7 @@ durability-for-always-on goal; terminal-bricking behind a documented
 non-guarantee is worse still. Surfaced as Greptile P1 on the round-7 review;
 Matt's call.
 
-### (i) Paused-restart async completions enqueue and gate on turn-start, not delivery
+### (i) Paused-restart wakes gate on turn-start, not delivery (async + IRC)
 
 While `#restarting`, a background job that finishes must not wake a turn that
 appends past the durability barrier (step 5). An earlier draft short-circuited
@@ -1050,23 +1066,37 @@ serves.
 
 Chosen: **do not intercept delivery.** `onJobComplete` enqueues to `yieldQueue`
 normally; the `#restarting` latch already gates turn *start*, which is the only
-thing that must be suppressed. The sole path that turns a queued async result into
-a new turn is idle-injection (`injectIdle`, `agent-session.ts:2270-2274`).
-Critically, that closure calls `this.agent.prompt` — the **raw agent**
-(`agent-session.ts:2273`), *not* `AgentSession.prompt` — so it does **not** inherit
+thing that must be suppressed. Two closures start a turn by calling the **raw
+agent** `this.agent.prompt` — *not* `AgentSession.prompt` — so neither inherits
 the `#restarting`/`AgentBusyError` guard on `AgentSession.prompt`
-(`agent-session.ts:7870`, `:7918-7919`); the latch check must be added inside the
-`injectIdle` closure itself (a `#restarting` early-return before
-`this.agent.prompt`). Mid-run asides (`setAsideMessageProvider`,
-`agent-session.ts:2289`) inject only into an already-running turn at a step
-boundary, and step 3's `waitForIdle` guarantees no turn is streaming across the
-restart window, so once `injectIdle` is gated it is the only reachable waker. On a
-successful restart `dispose()`'s `yieldQueue.clear()` drops the queued
-entry (correct — the replacement re-derives job state); on a recoverable failure it
-stays queued for the resumed session to drain. Rejected: the store-and-replay
-buffer (extra cross-boundary state for a rare error path) and accepting the drop
-(the silent durability hole above). Surfaced as Greptile P1 on the round-9 review;
-Matt's call.
+(`agent-session.ts:7870`, `:7918-7919`), and each needs its own `#restarting`
+early-return:
+
+- **idle-injection** (`injectIdle`, `agent-session.ts:2270-2274`, calling the raw
+  agent at `:2273`) turns a queued async result into a turn. On a successful
+  restart `dispose()`'s `yieldQueue.clear()` (`agent-session.ts:5844`) drops the
+  queued entry (correct — the replacement re-derives job state); on a recoverable
+  failure it stays queued for the resumed session to drain.
+- **IRC wake** (`#wakeForIrc`, `agent-session.ts:2098`) turns an incoming peer
+  message into a turn; it is the shared choke point for stranded-aside resume
+  (`agent-session.ts:2074`) and idle IRC delivery (`agent-session.ts:14980`).
+  Its callers drain the pending IRC records into a local array *before* the wake
+  (`agent-session.ts:2056-2058`), so the early-return must **preserve** them —
+  re-queued to `#pendingIrcInterrupts`/`#pendingIrcAsides` — not silently drop.
+  Preserved records flush to transcript on a successful restart via
+  `#flushPendingIrcAsides()` (`agent-session.ts:5843`→`:15196`), and stay pending
+  for the resumed session on a recoverable failure. Same durability guarantee as
+  the async path, different carrier.
+
+Mid-run asides (`setAsideMessageProvider`, `agent-session.ts:2289`) inject only
+into an already-running turn at a step boundary, and step 3's `waitForIdle`
+guarantees no turn is streaming across the restart window, so once both
+raw-prompt closures are gated no reachable waker remains. Rejected: the
+store-and-replay buffer (extra cross-boundary state for a rare error path) and
+accepting the drop (the silent durability hole above). The async half surfaced as
+a Greptile P1 on the round-9 review; the IRC-wake gap as a Greptile P1 on
+re-review of r12 — a faithful extension of the same decision to the second
+raw-prompt path, not a new design choice. Matt's call.
 
 ### (j) Drained refresh failure is observable; `onBeforeRefresh` writes are atomic
 
