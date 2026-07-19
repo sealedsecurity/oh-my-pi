@@ -519,7 +519,11 @@ no-session-file guard → busy guard (`hasQueuedMessages()`) — these return
 turns *and* new refreshes; async-job completions still enqueue, but the
 turn-start gate — a `#restarting` early-return added inside the `injectIdle`
 closure (`agent-session.ts:2270`), since it calls the raw agent and skips
-`AgentSession.prompt`'s guard — keeps a queued result from waking a turn —
+`AgentSession.prompt`'s guard; the same guard also short-circuits on
+`#isDisposed` so a post-dispose async completion cannot re-wake a torn-down
+session even if dispose's internal ordering later changes (defense-in-depth —
+dispose already clears `yieldQueue` before draining jobs) — keeps a queued
+result from waking a turn —
 decision (i)) and cache the committed
 attempt on `#restartCall` → `waitForIdle()` → capture durable `getSessionId()` +
 `sessionFile` → `flush()` + `ensureOnDisk()` → drain the in-flight refresh's
@@ -948,7 +952,7 @@ this record's target deployment.
 ### (h) Pre-dispose failure unlatches; post-dispose failure is terminal
 
 The re-entrancy guard caches `#restartCall` the way `dispose()` caches
-`#disposeCall` (decision (e), `agent-session.ts:5861-5865`), but the two failure
+`#disposeCall` (decision (g), `agent-session.ts:5861-5865`), but the two failure
 modes are not symmetric. `dispose()` is one-way, so caching its settled promise
 forever — resolved or rejected — is correct. `requestRestart()` sets the
 `#restarting` latch (step 3) and then runs fallible work while the session is
